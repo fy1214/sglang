@@ -45,6 +45,11 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 )
 from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.pipelines_core.cache_dit_integration import (
+    CacheDitConfig,
+    enable_cache_on_transformer,
+    is_cache_dit_available,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -58,12 +63,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.pipelines_core.cache_dit_integration import (
-    CacheDitConfig,
-    enable_cache_on_transformer,
-    is_cache_dit_available,
-    get_cache_summary,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
@@ -220,10 +219,13 @@ class DenoisingStage(PipelineStage):
             max_continuous_cached_steps=getattr(server_args, "cache_dit_mc", 3),
             enable_taylorseer=getattr(server_args, "cache_dit_taylorseer", True),
             taylorseer_order=getattr(server_args, "cache_dit_ts_order", 1),
+            quantize=getattr(server_args, "cache_dit_quantize", False),
+            quantize_type=getattr(
+                server_args, "cache_dit_quantize_type", "float8_weight_only"
+            ),
             num_inference_steps=num_inference_steps,
         )
 
-        
         self.transformer = enable_cache_on_transformer(
             self.transformer,
             config,
@@ -235,7 +237,6 @@ class DenoisingStage(PipelineStage):
             "cache-dit enabled successfully on transformer (steps=%d)",
             num_inference_steps,
         )
-        
 
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):
@@ -1030,11 +1031,11 @@ class DenoisingStage(PipelineStage):
         # func.args[0] is the transformer instance
         if isinstance(func, functools.partial) and func.args:
             transformer_instance = func.args[0]
-            if hasattr(transformer_instance, '_original_forward'):
+            if hasattr(transformer_instance, "_original_forward"):
                 target_func = transformer_instance._original_forward
 
         # Handle functools.wraps
-        while hasattr(target_func, '__wrapped__'):
+        while hasattr(target_func, "__wrapped__"):
             target_func = target_func.__wrapped__
 
         sig = inspect.signature(target_func)

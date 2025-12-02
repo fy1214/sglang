@@ -283,6 +283,8 @@ class ServerArgs:
     cache_dit_mc: int = 3  # Maximum continuous cached steps
     cache_dit_taylorseer: bool = True  # Enable TaylorSeer calibrator
     cache_dit_ts_order: int = 1  # TaylorSeer order (1 or 2)
+    cache_dit_quantize: bool = False
+    cache_dit_quantize_type: str = "float8_weight_only"
 
     disable_autocast: bool = False
 
@@ -594,6 +596,18 @@ class ServerArgs:
             default=ServerArgs.cache_dit_ts_order,
             choices=[1, 2],
             help="TaylorSeer Taylor expansion order (1 or 2).",
+        )
+        parser.add_argument(
+            "--cache-dit-quantize",
+            action=StoreBoolean,
+            default=ServerArgs.cache_dit_quantize,
+            help="Enable quantize for cache-dit.",
+        )
+        parser.add_argument(
+            "--cache-dit-quantize_type",
+            type=str,
+            default=ServerArgs.cache_dit_quantize_type,
+            help="The quantize type when suing cache-dit quantize.",
         )
 
         parser.add_argument(

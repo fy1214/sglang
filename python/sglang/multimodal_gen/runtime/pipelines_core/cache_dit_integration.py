@@ -60,6 +60,8 @@ class CacheDitConfig:
     enable_taylorseer: bool = True
     taylorseer_order: int = 1
     num_inference_steps: Optional[int] = None
+    quantize: bool = False
+    quantize_type: str = "float8_weight_only"
 
 
 def enable_cache_on_transformer(
@@ -147,6 +149,9 @@ def enable_cache_on_transformer(
         cache_config=cache_config,
         calibrator_config=calibrator_config,
     )
+
+    if config.quantize:
+        transformer = cache_dit.quantize(transformer, quant_type=config.quantize_type)
 
     return transformer
 
