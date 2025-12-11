@@ -7,11 +7,17 @@ import logging
 from enum import Enum
 from typing import TYPE_CHECKING
 
+try:
+    from sgl_kernel import fused_marlin_moe
+
+    FUSED_MARLIN_MOE_AVAILABLE = True
+except ImportError:
+    FUSED_MARLIN_MOE_AVAILABLE = False
+
 import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -45,12 +51,19 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
+    from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
+
+if _is_cuda:
+    from sgl_kernel import fused_marlin_moe
 
 logger = logging.getLogger(__name__)
+
+
+def _mask_topk_ids_cpu_experts(topk_ids: torch.Tensor, num_gpu_experts: int):
+    """Mask topk_ids >= num_gpu_experts by setting them to -1."""
+    topk_ids[topk_ids >= num_gpu_experts] = -1
 
 
 class GPTQMarlinState(Enum):
@@ -82,8 +95,8 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
 
         weight_quant = quant_config.target_scheme_map["Linear"].get("weights")
         input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
-
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
+
             logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
             return CompressedTensorsWNA16MoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
@@ -103,28 +116,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             "input_activations"
         )
 
-        per_tensor = (
-            self.weight_quant.strategy == QuantizationStrategy.TENSOR
-            and self.input_quant.strategy == QuantizationStrategy.TENSOR
-        )
-        per_channel = (
-            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-            and self.input_quant.strategy == QuantizationStrategy.TOKEN
-        )
-        if not (per_tensor or per_channel):
-            assert self.weight_quant.strategy == QuantizationStrategy.BLOCK
-            self.weight_block_size = self.weight_quant.block_structure
-            assert self.weight_quant.dynamic is not None
-        else:
-            self.weight_block_size = None
-        self.block_quant = self.weight_block_size is not None
-
         self.static_input_scales = not self.input_quant.dynamic
-        if self.static_input_scales and per_channel:
-            raise ValueError(
-                "For FP8 Fused MoE layer, we require either per tensor or "
-                "channelwise, dynamic per token quantization."
-            )
 
     def create_weights(
         self,
@@ -138,32 +130,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         params_dtype = torch.float8_e4m3fn
-
-        if self.block_quant:
-            assert self.weight_block_size is not None
-            layer.weight_block_size = self.weight_block_size
-            tp_size = get_tensor_model_parallel_world_size()
-            block_n, block_k = (
-                self.weight_block_size[0],
-                self.weight_block_size[1],
-            )
-            # NOTE: To ensure proper alignment of the block-wise quantization
-            # scales, the output_size of the weights for both the gate and up
-            # layers must be divisible by block_n.
-            # Required by column parallel or enabling merged weights
-            if intermediate_size_per_partition % block_n != 0:
-                raise ValueError(
-                    f"The output_size of gate's and up's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_n = {block_n}."
-                )
-            if tp_size > 1 and intermediate_size_per_partition % block_k != 0:
-                # Required by row parallel
-                raise ValueError(
-                    f"The input_size of down's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_k = {block_k}."
-                )
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
@@ -217,26 +183,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
             weight_quant_method = FusedMoeWeightScaleSupported.CHANNEL.value
-        elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
-            w13_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    num_experts,
-                    2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
-                    (hidden_size + block_k - 1) // block_k,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            w2_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    num_experts,
-                    (hidden_size + block_n - 1) // block_n,
-                    (intermediate_size_per_partition + block_k - 1) // block_k,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            weight_quant_method = FusedMoeWeightScaleSupported.BLOCK.value
         else:
             raise ValueError(
                 f"Unsupported weight quantization strategy: {self.weight_quant.strategy}"
@@ -273,6 +219,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
+
         if self.static_input_scales:
             if layer.w13_input_scale is None or layer.w2_input_scale is None:
                 raise ValueError(
@@ -345,7 +292,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 max_w13_scales, requires_grad=False
             )
 
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+        if _use_aiter:
             with torch.no_grad():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
@@ -378,51 +325,29 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
         moe_runner_config = self.moe_runner_config
 
-        if _use_aiter and self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
-            assert not moe_runner_config.no_combine, "unsupported"
+        if (
+            _use_aiter
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and moe_runner_config.apply_router_weight_on_input
+        ):
             topk_weights, topk_ids, _ = topk_output
-            if moe_runner_config.apply_router_weight_on_input:
-                assert (
-                    topk_weights.dim() == 2
-                ), "`topk_weights` should be in shape (num_tokens, topk)"
-                _, topk = topk_weights.shape
-                assert (
-                    topk == 1
-                ), "Only support topk=1 when `apply_router_weight_on_input` is True"
-                x = x * topk_weights.to(x.dtype)
-                topk_weights = torch.ones_like(
-                    topk_weights, dtype=torch.float32
-                )  # topk_weights must be FP32 (float32)
-            output = fused_moe(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                activation=(
-                    ActivationType.Silu
-                    if moe_runner_config.activation == "silu"
-                    else ActivationType.Gelu
-                ),
-                quant_type=QuantType.per_Token,
+            output = rocm_fused_experts_tkw1(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=moe_runner_config.activation,
+                apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+                use_fp8_w8a8=True,
+                per_channel_quant=self.weight_quant.strategy
+                == QuantizationStrategy.CHANNEL,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
             )
             return StandardCombineInput(hidden_states=output)
-        elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8_w8a8=True,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                block_shape=self.weight_block_size,
-            )
-            return self.runner.run(dispatch_output, quant_info)
         else:
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
@@ -488,6 +413,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             ),
             requires_grad=False,
         )
+
         layer.register_parameter("w13_weight_packed", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
@@ -502,6 +428,13 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         )
         layer.register_parameter("w2_weight_packed", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        if not hasattr(layer, "_original_shapes"):
+            layer._original_shapes = {}
+
+        # 强制记录：这就是你要回退到的 GPTQ Shape
+        layer._original_shapes["w13_weight_packed"] = tuple(w13_weight.shape)
+        layer._original_shapes["w2_weight_packed"] = tuple(w2_weight.shape)
 
         # In the case where we have actorder/g_idx,
         # we do not partition the w2 scales
@@ -553,6 +486,10 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.register_parameter("w13_weight_shape", w13_weight_shape)
         set_weight_attrs(w13_weight_shape, extra_weight_attrs)
 
+        ### 这两个也做了记录
+        layer._original_shapes["w2_weight_scale"] = tuple(w2_scale.shape)
+        layer._original_shapes["w13_weight_scale"] = tuple(w13_scale.shape)
+
         w13_g_idx = torch.nn.Parameter(
             torch.empty(
                 num_experts,
@@ -601,20 +538,101 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.a2_scale = None
         layer.marlin_state = GPTQMarlinState.REPACK
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        topk_weights, topk_ids, router_logits = topk_output
+
+        output = fused_marlin_moe(
+            x,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            g_idx1=layer.w13_weight_g_idx,
+            g_idx2=layer.w2_weight_g_idx,
+            sort_indices1=layer.w13_g_idx_sort_indices,
+            sort_indices2=layer.w2_g_idx_sort_indices,
+            num_bits=self.num_bits,
+            is_k_full=self.is_k_full,
+            expert_map=torch.empty(1, device=x.device),
+        )
+        return StandardCombineInput(hidden_states=output)
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module):
+        """
+        [关键函数] 在 load_weights 开始前调用。
+        将显存中的 Parameter 形状强制 resize 回 create_weights 时的原始形状。
+        """
+        # 如果没有存档，说明是第一次运行，不需要复原
+        if not hasattr(layer, "_original_shapes"):
+            return
+
+        # print(f"[Debug] Restoring layer shapes to GPTQ format...", flush=True)
+
+        for name, orig_shape in layer._original_shapes.items():
+            if hasattr(layer, name):
+                # 获取显存里的 Parameter 对象
+                param = getattr(layer, name)
+
+                # 检查：如果当前形状 (Marlin) != 存档形状 (GPTQ)
+                if param.shape != orig_shape:
+                    # print(f"  [Restore Action] Resizing {name}: {param.shape} -> {orig_shape}", flush=True)
+
+                    # [核心操作] 改变 Parameter 自身的形状！
+                    # 这一步执行完，Parameter 就准备好接收 load_weights 的数据了
+                    param.resize_(orig_shape)
+
+        # 设为 False，表示现在是“原始状态”
+        layer.is_marlin_converted = False
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, force=False
+    ) -> None:
+        # 1. 幂等性检查：防止重复执行 (除非强制执行)
+        if not force and getattr(layer, "is_marlin_converted", False):
+            return
+
+        # 2. 初始化形状记录字典
+        if not hasattr(layer, "_original_shapes"):
+            layer._original_shapes = {}
 
         def replace_tensor(name, new_t):
-            # It is important to use resize_() here since it ensures
-            # the same buffer is reused
-            getattr(layer, name).resize_(new_t.shape)
-            getattr(layer, name).copy_(new_t)
+            target_attr = getattr(layer, name)
+
+            # [修改] 只有当字典里没有的时候才记录 (避免把 Marlin 形状当成原始形状记录进去)
+            if name not in layer._original_shapes:
+                # 正常情况下 create_weights 已经记录了，这里是个保险
+                layer._original_shapes[name] = tuple(target_attr.shape)
+
+            target_attr.resize_(new_t.shape)
+            target_attr.copy_(new_t)
             del new_t
 
         num_experts = layer.w13_weight_g_idx.shape[0]
         device = layer.w13_weight_g_idx.device
 
-        # when running models with grouped act order,
-        # resort to g_idx values provided in checkpoint
+        # --- 处理 actorder / g_idx (保持原有逻辑) ---
         if self.actorder == "group":
             w13_g_idx_sort_indices = torch.empty_like(layer.w13_weight_g_idx)
             w2_g_idx_sort_indices = torch.empty_like(layer.w2_weight_g_idx)
@@ -633,12 +651,14 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 ]
                 w2_sorted_g_idx[e] = layer.w2_weight_g_idx[e][w2_g_idx_sort_indices[e]]
 
+            # g_idx 这种辅助数据可以用 replace_parameter 直接替换
             replace_parameter(layer, "w13_weight_g_idx", w13_sorted_g_idx)
             replace_parameter(layer, "w2_weight_g_idx", w2_sorted_g_idx)
             replace_parameter(layer, "w13_g_idx_sort_indices", w13_g_idx_sort_indices)
             replace_parameter(layer, "w2_g_idx_sort_indices", w2_g_idx_sort_indices)
 
         else:
+            # 初始化为空 Parameter
             layer.w13_weight_g_idx = torch.nn.Parameter(
                 torch.empty((num_experts, 0), dtype=torch.int32, device=device),
                 requires_grad=False,
@@ -656,6 +676,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
 
+        # --- 核心权重处理 (必须使用 replace_tensor) ---
+
+        # 1. w13 Packed Weight
         marlin_w13_qweight = gptq_marlin_moe_repack(
             layer.w13_weight_packed,
             layer.w13_g_idx_sort_indices,
@@ -663,7 +686,13 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_weight_packed.shape[2],
             self.num_bits,
         )
-        replace_parameter(layer, "w13_weight_packed", marlin_w13_qweight)
+        # print(
+        #    f'[Debug marlin start ] Converting w13 packed: {layer.w13_weight_packed.shape} -> {marlin_w13_qweight.shape}',
+        #    flush=True)
+        # [修改] 使用内部函数
+        replace_tensor("w13_weight_packed", marlin_w13_qweight)
+
+        # 2. w2 Packed Weight
         marlin_w2_qweight = gptq_marlin_moe_repack(
             layer.w2_weight_packed,
             layer.w2_g_idx_sort_indices,
@@ -671,15 +700,24 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_packed.shape[2],
             self.num_bits,
         )
-        replace_parameter(layer, "w2_weight_packed", marlin_w2_qweight)
-        # Repack scales
+        # [修改] 使用内部函数
+        # print(
+        #    f'[Debug marlin start ] Converting w2 weight : {layer.w2_weight_packed.shape} -> {marlin_w2_qweight.shape}',
+        #    flush=True)
+
+        replace_tensor("w2_weight_packed", marlin_w2_qweight)
+
+        # 3. Scales (Scales 也会变形，必须使用 replace_tensor 记录形状)
         marlin_w13_scales = marlin_moe_permute_scales(
             layer.w13_weight_scale,
             layer.w13_weight_packed.shape[2],
             layer.w13_weight_scale.shape[2],
             self.group_size,
         )
-        replace_parameter(layer, "w13_weight_scale", marlin_w13_scales)
+        # [修改] 使用内部函数
+        replace_tensor("w13_weight_scale", marlin_w13_scales)
+
+        # print(f'[Debug marlin start ] Converting w2 weight : {layer.w2_weight_packed.shape} -> {marlin_w2_qweight.shape}', flush=True)
 
         marlin_w2_scales = marlin_moe_permute_scales(
             layer.w2_weight_scale,
@@ -688,59 +726,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_scale.shape[2],
             self.group_size,
         )
-        replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
+        # [修改] 使用内部函数
+        replace_tensor("w2_weight_scale", marlin_w2_scales)
 
-    def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
-    ):
-        self.moe_runner_config = moe_runner_config
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
-    ) -> CombineInput:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
-        )
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-
-        topk_weights, topk_ids, router_logits = topk_output
-
-        # Get expert_map for EP support
-        expert_map = None
-        global_num_experts = -1
-        if hasattr(layer, "dispatcher") and hasattr(
-            layer.dispatcher, "local_expert_mapping"
-        ):
-            expert_map = layer.dispatcher.local_expert_mapping
-            if expert_map is not None:
-                global_num_experts = self.moe_runner_config.num_experts
-
-        output = fused_marlin_moe(
-            x,
-            layer.w13_weight_packed,
-            layer.w2_weight_packed,
-            layer.w13_weight_scale,
-            layer.w2_weight_scale,
-            router_logits,
-            topk_weights,
-            topk_ids,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            g_idx1=layer.w13_weight_g_idx,
-            g_idx2=layer.w2_weight_g_idx,
-            sort_indices1=layer.w13_g_idx_sort_indices,
-            sort_indices2=layer.w2_g_idx_sort_indices,
-            num_bits=self.num_bits,
-            is_k_full=self.is_k_full,
-            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
-        )
-        return StandardCombineInput(hidden_states=output)
+        # 4. 标记转换完成
+        layer.is_marlin_converted = True
