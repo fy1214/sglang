@@ -55,7 +55,6 @@ if _use_aiter:
 
     from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
-
 if _is_cuda:
     from sgl_kernel import fused_marlin_moe
 
@@ -220,6 +219,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
+
         if self.static_input_scales:
             if layer.w13_input_scale is None or layer.w2_input_scale is None:
                 raise ValueError(
@@ -413,6 +413,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             ),
             requires_grad=False,
         )
+
         layer.register_parameter("w13_weight_packed", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
@@ -427,6 +428,13 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         )
         layer.register_parameter("w2_weight_packed", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        if not hasattr(layer, "_original_shapes"):
+            layer._original_shapes = {}
+
+        # 强制记录：这就是你要回退到的 GPTQ Shape
+        layer._original_shapes["w13_weight_packed"] = tuple(w13_weight.shape)
+        layer._original_shapes["w2_weight_packed"] = tuple(w2_weight.shape)
 
         # In the case where we have actorder/g_idx,
         # we do not partition the w2 scales
@@ -478,6 +486,10 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.register_parameter("w13_weight_shape", w13_weight_shape)
         set_weight_attrs(w13_weight_shape, extra_weight_attrs)
 
+        ### 这两个也做了记录
+        layer._original_shapes["w2_weight_scale"] = tuple(w2_scale.shape)
+        layer._original_shapes["w13_weight_scale"] = tuple(w13_scale.shape)
+
         w13_g_idx = torch.nn.Parameter(
             torch.empty(
                 num_experts,
@@ -526,95 +538,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.a2_scale = None
         layer.marlin_state = GPTQMarlinState.REPACK
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-
-        def replace_tensor(name, new_t):
-            # It is important to use resize_() here since it ensures
-            # the same buffer is reused
-            getattr(layer, name).resize_(new_t.shape)
-            getattr(layer, name).copy_(new_t)
-            del new_t
-
-        num_experts = layer.w13_weight_g_idx.shape[0]
-        device = layer.w13_weight_g_idx.device
-
-        # when running models with grouped act order,
-        # resort to g_idx values provided in checkpoint
-        if self.actorder == "group":
-            w13_g_idx_sort_indices = torch.empty_like(layer.w13_weight_g_idx)
-            w2_g_idx_sort_indices = torch.empty_like(layer.w2_weight_g_idx)
-            w13_sorted_g_idx = torch.empty_like(layer.w13_weight_g_idx)
-            w2_sorted_g_idx = torch.empty_like(layer.w2_weight_g_idx)
-
-            for e in range(num_experts):
-                w13_g_idx_sort_indices[e] = torch.argsort(layer.w13_weight_g_idx[e]).to(
-                    torch.int32
-                )
-                w2_g_idx_sort_indices[e] = torch.argsort(layer.w2_weight_g_idx[e]).to(
-                    torch.int32
-                )
-                w13_sorted_g_idx[e] = layer.w13_weight_g_idx[e][
-                    w13_g_idx_sort_indices[e]
-                ]
-                w2_sorted_g_idx[e] = layer.w2_weight_g_idx[e][w2_g_idx_sort_indices[e]]
-
-            replace_parameter(layer, "w13_weight_g_idx", w13_sorted_g_idx)
-            replace_parameter(layer, "w2_weight_g_idx", w2_sorted_g_idx)
-            replace_parameter(layer, "w13_g_idx_sort_indices", w13_g_idx_sort_indices)
-            replace_parameter(layer, "w2_g_idx_sort_indices", w2_g_idx_sort_indices)
-
-        else:
-            layer.w13_weight_g_idx = torch.nn.Parameter(
-                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
-                requires_grad=False,
-            )
-            layer.w2_weight_g_idx = torch.nn.Parameter(
-                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
-                requires_grad=False,
-            )
-            layer.w13_g_idx_sort_indices = torch.nn.Parameter(
-                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
-                requires_grad=False,
-            )
-            layer.w2_g_idx_sort_indices = torch.nn.Parameter(
-                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
-                requires_grad=False,
-            )
-
-        marlin_w13_qweight = gptq_marlin_moe_repack(
-            layer.w13_weight_packed,
-            layer.w13_g_idx_sort_indices,
-            layer.w13_weight_packed.shape[1] * self.packed_factor,
-            layer.w13_weight_packed.shape[2],
-            self.num_bits,
-        )
-        replace_parameter(layer, "w13_weight_packed", marlin_w13_qweight)
-        marlin_w2_qweight = gptq_marlin_moe_repack(
-            layer.w2_weight_packed,
-            layer.w2_g_idx_sort_indices,
-            layer.w2_weight_packed.shape[1] * self.packed_factor,
-            layer.w2_weight_packed.shape[2],
-            self.num_bits,
-        )
-        replace_parameter(layer, "w2_weight_packed", marlin_w2_qweight)
-        # Repack scales
-        marlin_w13_scales = marlin_moe_permute_scales(
-            layer.w13_weight_scale,
-            layer.w13_weight_packed.shape[2],
-            layer.w13_weight_scale.shape[2],
-            self.group_size,
-        )
-        replace_parameter(layer, "w13_weight_scale", marlin_w13_scales)
-
-        marlin_w2_scales = marlin_moe_permute_scales(
-            layer.w2_weight_scale,
-            layer.w2_weight_scale.shape[1]
-            * (self.group_size if self.group_size != -1 else self.packed_factor),
-            layer.w2_weight_scale.shape[2],
-            self.group_size,
-        )
-        replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
-
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -655,3 +578,156 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             expert_map=torch.empty(1, device=x.device),
         )
         return StandardCombineInput(hidden_states=output)
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module):
+        """
+        [关键函数] 在 load_weights 开始前调用。
+        将显存中的 Parameter 形状强制 resize 回 create_weights 时的原始形状。
+        """
+        # 如果没有存档，说明是第一次运行，不需要复原
+        if not hasattr(layer, "_original_shapes"):
+            return
+
+        # print(f"[Debug] Restoring layer shapes to GPTQ format...", flush=True)
+
+        for name, orig_shape in layer._original_shapes.items():
+            if hasattr(layer, name):
+                # 获取显存里的 Parameter 对象
+                param = getattr(layer, name)
+
+                # 检查：如果当前形状 (Marlin) != 存档形状 (GPTQ)
+                if param.shape != orig_shape:
+                    # print(f"  [Restore Action] Resizing {name}: {param.shape} -> {orig_shape}", flush=True)
+
+                    # [核心操作] 改变 Parameter 自身的形状！
+                    # 这一步执行完，Parameter 就准备好接收 load_weights 的数据了
+                    param.resize_(orig_shape)
+
+        # 设为 False，表示现在是“原始状态”
+        layer.is_marlin_converted = False
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, force=False
+    ) -> None:
+        # 1. 幂等性检查：防止重复执行 (除非强制执行)
+        if not force and getattr(layer, "is_marlin_converted", False):
+            return
+
+        # 2. 初始化形状记录字典
+        if not hasattr(layer, "_original_shapes"):
+            layer._original_shapes = {}
+
+        def replace_tensor(name, new_t):
+            target_attr = getattr(layer, name)
+
+            # [修改] 只有当字典里没有的时候才记录 (避免把 Marlin 形状当成原始形状记录进去)
+            if name not in layer._original_shapes:
+                # 正常情况下 create_weights 已经记录了，这里是个保险
+                layer._original_shapes[name] = tuple(target_attr.shape)
+
+            target_attr.resize_(new_t.shape)
+            target_attr.copy_(new_t)
+            del new_t
+
+        num_experts = layer.w13_weight_g_idx.shape[0]
+        device = layer.w13_weight_g_idx.device
+
+        # --- 处理 actorder / g_idx (保持原有逻辑) ---
+        if self.actorder == "group":
+            w13_g_idx_sort_indices = torch.empty_like(layer.w13_weight_g_idx)
+            w2_g_idx_sort_indices = torch.empty_like(layer.w2_weight_g_idx)
+            w13_sorted_g_idx = torch.empty_like(layer.w13_weight_g_idx)
+            w2_sorted_g_idx = torch.empty_like(layer.w2_weight_g_idx)
+
+            for e in range(num_experts):
+                w13_g_idx_sort_indices[e] = torch.argsort(layer.w13_weight_g_idx[e]).to(
+                    torch.int32
+                )
+                w2_g_idx_sort_indices[e] = torch.argsort(layer.w2_weight_g_idx[e]).to(
+                    torch.int32
+                )
+                w13_sorted_g_idx[e] = layer.w13_weight_g_idx[e][
+                    w13_g_idx_sort_indices[e]
+                ]
+                w2_sorted_g_idx[e] = layer.w2_weight_g_idx[e][w2_g_idx_sort_indices[e]]
+
+            # g_idx 这种辅助数据可以用 replace_parameter 直接替换
+            replace_parameter(layer, "w13_weight_g_idx", w13_sorted_g_idx)
+            replace_parameter(layer, "w2_weight_g_idx", w2_sorted_g_idx)
+            replace_parameter(layer, "w13_g_idx_sort_indices", w13_g_idx_sort_indices)
+            replace_parameter(layer, "w2_g_idx_sort_indices", w2_g_idx_sort_indices)
+
+        else:
+            # 初始化为空 Parameter
+            layer.w13_weight_g_idx = torch.nn.Parameter(
+                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+                requires_grad=False,
+            )
+            layer.w2_weight_g_idx = torch.nn.Parameter(
+                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+                requires_grad=False,
+            )
+            layer.w13_g_idx_sort_indices = torch.nn.Parameter(
+                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+                requires_grad=False,
+            )
+            layer.w2_g_idx_sort_indices = torch.nn.Parameter(
+                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+                requires_grad=False,
+            )
+
+        # --- 核心权重处理 (必须使用 replace_tensor) ---
+
+        # 1. w13 Packed Weight
+        marlin_w13_qweight = gptq_marlin_moe_repack(
+            layer.w13_weight_packed,
+            layer.w13_g_idx_sort_indices,
+            layer.w13_weight_packed.shape[1] * self.packed_factor,
+            layer.w13_weight_packed.shape[2],
+            self.num_bits,
+        )
+        # print(
+        #    f'[Debug marlin start ] Converting w13 packed: {layer.w13_weight_packed.shape} -> {marlin_w13_qweight.shape}',
+        #    flush=True)
+        # [修改] 使用内部函数
+        replace_tensor("w13_weight_packed", marlin_w13_qweight)
+
+        # 2. w2 Packed Weight
+        marlin_w2_qweight = gptq_marlin_moe_repack(
+            layer.w2_weight_packed,
+            layer.w2_g_idx_sort_indices,
+            layer.w2_weight_packed.shape[1] * self.packed_factor,
+            layer.w2_weight_packed.shape[2],
+            self.num_bits,
+        )
+        # [修改] 使用内部函数
+        # print(
+        #    f'[Debug marlin start ] Converting w2 weight : {layer.w2_weight_packed.shape} -> {marlin_w2_qweight.shape}',
+        #    flush=True)
+
+        replace_tensor("w2_weight_packed", marlin_w2_qweight)
+
+        # 3. Scales (Scales 也会变形，必须使用 replace_tensor 记录形状)
+        marlin_w13_scales = marlin_moe_permute_scales(
+            layer.w13_weight_scale,
+            layer.w13_weight_packed.shape[2],
+            layer.w13_weight_scale.shape[2],
+            self.group_size,
+        )
+        # [修改] 使用内部函数
+        replace_tensor("w13_weight_scale", marlin_w13_scales)
+
+        # print(f'[Debug marlin start ] Converting w2 weight : {layer.w2_weight_packed.shape} -> {marlin_w2_qweight.shape}', flush=True)
+
+        marlin_w2_scales = marlin_moe_permute_scales(
+            layer.w2_weight_scale,
+            layer.w2_weight_scale.shape[1]
+            * (self.group_size if self.group_size != -1 else self.packed_factor),
+            layer.w2_weight_scale.shape[2],
+            self.group_size,
+        )
+        # [修改] 使用内部函数
+        replace_tensor("w2_weight_scale", marlin_w2_scales)
+
+        # 4. 标记转换完成
+        layer.is_marlin_converted = True

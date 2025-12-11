@@ -641,6 +641,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
@@ -3092,6 +3093,18 @@ class DeepseekV2ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def rl_quant(self):
+        from sglang.srt.model_loader.loader import device_loading_context
+
+        # Process quantization methods after loading weights
+        for _, module in self.model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # Move parameters to device if needed for quantization processing
+                target_device = torch.device("cuda", torch.cuda.current_device())
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
     @torch.no_grad()
     def forward(
         self,
@@ -3101,6 +3114,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        self.rl_quant()
+        # self.inspect_parameters('forward')
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
         )
@@ -3442,7 +3457,94 @@ class DeepseekV2ForCausalLM(nn.Module):
             ]:
                 transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
 
+    def inspect_parameters(self, title):
+        """
+        打印模型所有参数的统计信息。
+        Prints parameter statistics: Name, Shape, Dtype, Device, Requires_Grad.
+        """
+
+        print(f"\n{'=' * 60} | {title} | {'=' * 60}")
+        print(
+            f"{'Param Name':<55} | {'Shape':<25} | {'Dtype':<15} | {'Device':<10} | {'Grad'}"
+        )
+        print(f"{'-' * 120}")
+
+        total_params = 0
+        trainable_params = 0
+
+        # 虽然题目是 print self.parameters()，但使用 named_parameters() 更利于调试
+        # 如果必须严格只遍历 parameters()，可以使用 enumerate(self.parameters())，但会丢失名字信息
+        for name, param in self.named_parameters():
+            # 计算参数量
+            num_params = param.numel()
+            total_params += num_params
+            if param.requires_grad:
+                trainable_params += num_params
+
+            shape_str = str(tuple(param.shape))
+            dtype_str = str(param.dtype).replace("torch.", "")
+            device_str = str(param.device)
+            grad_str = str(param.requires_grad)
+
+            print(
+                f"{name:<55} | {shape_str:<25} | {dtype_str:<15} | {device_str:<10} | {grad_str}"
+            )
+
+        print(f"{'-' * 120}")
+        print(f"Total Parameters: {total_params:,}")
+        print(f"Trainable Parameters: {trainable_params:,}")
+        print(f"{'=' * 120}\n")
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        # self.inspect_parameters('load_weight')
+        layers_list = None
+        if hasattr(self, "model") and hasattr(self.model, "layers"):
+            # 大多数情况：self 是 ForCausalLM，layers 在 internal model 里
+            layers_list = self.model.layers
+            # print("[Debug] Found layers in 'self.model.layers'", flush=True)
+        elif hasattr(self, "layers"):
+            # 少数情况：self 本身就是 Model
+            layers_list = self.layers
+            # print("[Debug] Found layers in 'self.layers'", flush=True)
+        else:
+            print(
+                "[Error] CRITICAL: Could not find .layers or .model.layers attribute!",
+                flush=True,
+            )
+
+        # 2. 遍历并复原
+        if layers_list is not None:
+            # print("\n[Debug Start] Starting Shape Restoration Logic...", flush=True)
+
+            for i, layer in enumerate(layers_list):
+                target_module = None
+
+                # 寻找 Expert 模块 (DeepSeek V2/V3 结构)
+                if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+                    target_module = layer.mlp.experts
+                elif hasattr(layer, "experts"):
+                    target_module = layer.experts
+
+                if target_module:
+                    # [核心修改点]
+                    # 不要用 self.quant_method (不存在)
+                    # 要用 target_module.quant_method (存在于具体层中)
+                    if hasattr(target_module, "quant_method"):
+                        qm = target_module.quant_method
+
+                        if hasattr(qm, "restore_weights_before_loading"):
+                            # print(f"[Debug] Restoring layer {i}...", flush=True)
+                            qm.restore_weights_before_loading(target_module)
+                        else:
+                            # 可能是非量化层或者没有定义该方法，跳过即可
+                            pass
+                    else:
+                        print(
+                            f"[Warn] Layer {i} experts found but no 'quant_method' attribute.",
+                            flush=True,
+                        )
+
+            # print("[Debug End] Shape Restoration Logic Finished.\n", flush=True)
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -3595,9 +3697,46 @@ class DeepseekV2ForCausalLM(nn.Module):
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
+                        hg_name = name
                         name = name.replace(weight_name, param_name)
                         param = params_dict[name]
                         weight_loader = param.weight_loader
+
+                        # weight_loader = getattr(
+                        #         param, "weight_loader", default_weight_loader
+                        #     )
+
+                        # print(f'[Debug the Dpsk]\n'
+                        #         f'origin name is {hg_name}\n'
+                        #         f'new name : {name} \n'
+                        #         f'weight_name {weight_name} \n'
+                        #         f'param_name: {param_name} \n'
+                        #         f'param shape is: {param.shape} \n'
+                        #         f'loaded_weight is {loaded_weight.shape} \n'
+                        #         , flush = True )
+
+                        # try:
+                        #     # 假设 name 格式为: "model.layers.{layer_id}.mlp.experts..."
+                        #     # 从名字中解析出 layer_id
+                        #     parts = name.split('.')
+                        #     if len(parts) > 2 and parts[1] == "layers":
+                        #         layer_id = int(parts[2])
+
+                        #         # 直接找到那个 Layer 实例！
+                        #         # DeepSeek V2/V3 结构通常是: model.layers[i].mlp.experts
+                        #         moe_layer_instance = self.model.layers[layer_id].mlp.experts
+
+                        #         # 获取绑定方法 <bound method FusedMoE.weight_loader of ...>
+                        #         # 这个方法里包含了 self.quant_method, self.tp_rank 等所有必要上下文
+                        #         weight_loader = moe_layer_instance.weight_loader
+                        #     else:
+                        #         raise ValueError(f"Cannot parse layer_id from {name}")
+
+                        # except Exception as e:
+                        #     print(f"[Error] Failed to retrieve FusedMoE instance: {e}")
+                        #     # 只有实在找不到时才用 default，但对于 MoE 大概率会报错
+                        #     weight_loader = param.weight_loader
+
                         maybe_executor_submit(
                             executor=executor,
                             futures=futures,
@@ -3766,6 +3905,36 @@ class DeepseekV2ForCausalLM(nn.Module):
                 future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        # layers_list = None
+        # if hasattr(self, "model") and hasattr(self.model, "layers"):
+        #     layers_list = self.model.layers
+        # elif hasattr(self, "layers"):
+        #     layers_list = self.layers
+
+        # if layers_list is not None:
+        #     print("[Post-Process] Re-processing weights to Marlin format...", flush=True)
+
+        #     for i, layer in enumerate(layers_list):
+        #         target_module = None
+
+        #         # 寻找 Expert 模块
+        #         if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+        #             target_module = layer.mlp.experts
+        #         elif hasattr(layer, "experts"):
+        #             target_module = layer.experts
+
+        #         if target_module:
+        #             # 确保 quant_method 存在
+        #             if hasattr(target_module, "quant_method"):
+        #                 # [可选] 打印一下进度
+        #                 # print(f"  Processing layer {i}...", flush=True)
+
+        #                 # 调用转换函数
+        #                 target_module.quant_method.process_weights_after_loading(target_module, force=True)
+        #             else:
+        #                 print(f"[Warn] Layer {i} has experts but no quant_method", flush=True)
+        # else:
+        #     print("[Error] Could not find layers list for post-processing!", flush=True)
 
     def _quant_attn_to_fp8_ue8m0(self, weights, is_nextn):
         weights_dict = dict(weights)
