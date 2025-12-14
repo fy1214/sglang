@@ -326,6 +326,11 @@ class ServerArgs:
     # Logging
     log_level: str = "info"
 
+    # Nunchaku
+    nunchaku_model: str = None
+    nunchaku_model_path: str = None
+    nunchaku_model_rank: int = 32
+
     @property
     def broker_port(self) -> int:
         return self.port + 1
@@ -622,6 +627,22 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.webui,
             help="Whether to use webui for better display",
+        )
+
+        parser.add_argument(
+            "--nunchaku-model",
+            type=str,
+            help="The model of the nunchaku weights.",
+        )
+        parser.add_argument(
+            "--nunchaku-model-path",
+            type=str,
+            help="The path of the nunchaku weights.",
+        )
+        parser.add_argument(
+            "--nunchaku-model-rank",
+            type=int,
+            help="Nunchaku weight's rank.",
         )
 
         parser.add_argument(

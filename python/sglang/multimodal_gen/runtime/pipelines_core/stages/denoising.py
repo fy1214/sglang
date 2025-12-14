@@ -311,6 +311,17 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = True
         self._cached_num_steps = num_inference_steps
 
+    def _maybe_enable_nunchaku(self):
+        from nunchaku import NunchakuFluxTransformer2dModel
+        from nunchaku.utils import get_precision
+
+        precision = (
+            get_precision()
+        )  # auto-detect your precision is 'int4' or 'fp4' based on your GPU
+        self.transformer = NunchakuFluxTransformer2dModel.from_pretrained(
+            f"{self.server_args.nunchaku_model_path}/svdq-{precision}_r{self.server_args.nunchaku_model_rank}-{self.server_args.nunchaku_model}-dev.safetensors"
+        )
+
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):
         """Builds a guidance tensor. This method is cached."""
@@ -497,6 +508,9 @@ class DenoisingStage(PipelineStage):
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args
             )
+
+            if server_args.nunchaku_model_path:
+                self._maybe_enable_nunchaku()
 
             # enable cache-dit before torch.compile (delayed mounting)
             self._maybe_enable_cache_dit(batch.num_inference_steps)
