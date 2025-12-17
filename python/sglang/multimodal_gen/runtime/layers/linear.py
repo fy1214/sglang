@@ -229,7 +229,6 @@ class ReplicatedLinear(LinearBase):
             params_dtype,
             quant_config,
             prefix=prefix,
-            quant_config=quant_config,
         )
 
         # All the linear layer supports quant method.
