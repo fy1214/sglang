@@ -176,7 +176,9 @@ def get_quant_config(
     packed_modules_mapping: Dict[str, List[str]] = {},
     remap_prefix: Dict[str, str] | None = None,
 ) -> QuantizationConfig:
-    quant_cls = get_quantization_config(model_config["quantization"])
+    quant_cls = get_quantization_config(
+        model_config["quantization_config"]["quant_method"]
+    )
 
     # GGUF doesn't have config file
     if model_config["quantization_config"]["quant_method"] == "gguf":

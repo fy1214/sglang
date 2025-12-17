@@ -151,15 +151,26 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
             self.add_q_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias,
+                quant_config=quant_config,
             )
             self.add_k_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias,
+                quant_config=quant_config,
             )
             self.add_v_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias,
+                quant_config=quant_config,
             )
-            self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
+            self.to_add_out = ReplicatedLinear(
+                self.inner_dim, query_dim, bias=out_bias, quant_config=quant_config
+            )
 
         self.attn = USPAttention(
             num_heads=num_heads,
