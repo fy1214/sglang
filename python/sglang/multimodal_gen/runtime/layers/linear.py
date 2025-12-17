@@ -232,7 +232,7 @@ class ReplicatedLinear(LinearBase):
         )
 
         # All the linear layer supports quant method.
-        assert self.quant_method is not None
+        # assert self.quant_method is not None
         self.quant_method.create_weights(
             self,
             self.input_size,
@@ -274,7 +274,7 @@ class ReplicatedLinear(LinearBase):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
-        assert self.quant_method is not None
+        # assert self.quant_method is not None
         output = self.quant_method.apply(self, x, bias)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
@@ -342,7 +342,7 @@ class ColumnParallelLinear(LinearBase):
         if output_sizes is None:
             output_sizes = [output_size]
 
-        assert self.quant_method is not None
+        # assert self.quant_method is not None
         self.quant_method.create_weights(
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
@@ -406,7 +406,7 @@ class ColumnParallelLinear(LinearBase):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
-        assert self.quant_method is not None
+        # assert self.quant_method is not None
         output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
@@ -614,7 +614,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             # FIXME(will): add fp8 support
             # from vllm.model_executor.layers.quantization.fp8 import (
             #     Fp8LinearMethod, Fp8MoEMethod)
-            # assert self.quant_method is not None
+            # # assert self.quant_method is not None
             # assert isinstance(self.quant_method,
             #                   (Fp8LinearMethod, Fp8MoEMethod))
             # weight_block_size = self.quant_method.quant_config.weight_block_size
@@ -959,7 +959,7 @@ class RowParallelLinear(LinearBase):
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
 
-        assert self.quant_method is not None
+        # assert self.quant_method is not None
         self.quant_method.create_weights(
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
@@ -1034,7 +1034,7 @@ class RowParallelLinear(LinearBase):
             input_parallel = splitted_input[tp_rank].contiguous()
 
         # Matrix multiply.
-        assert self.quant_method is not None
+        # assert self.quant_method is not None
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
