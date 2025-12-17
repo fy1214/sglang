@@ -341,7 +341,6 @@ class ColumnParallelLinear(LinearBase):
             params_dtype,
             quant_config,
             prefix,
-            quant_config=quant_config,
         )
 
         self.gather_output = gather_output
