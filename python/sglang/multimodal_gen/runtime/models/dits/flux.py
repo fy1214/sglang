@@ -517,6 +517,7 @@ class FluxTransformer2DModel(CachableDiT):
                     dim=self.inner_dim,
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
+                    quant_config=quant_config,
                 )
                 for _ in range(self.config.num_layers)
             ]
@@ -528,6 +529,7 @@ class FluxTransformer2DModel(CachableDiT):
                     dim=self.inner_dim,
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
+                    quant_config=quant_config,
                 )
                 for _ in range(self.config.num_single_layers)
             ]
@@ -540,6 +542,7 @@ class FluxTransformer2DModel(CachableDiT):
             self.inner_dim,
             self.config.patch_size * self.config.patch_size * self.out_channels,
             bias=True,
+            quant_config=quant_config,
         )
 
     def fuse_qkv_projections(self):
