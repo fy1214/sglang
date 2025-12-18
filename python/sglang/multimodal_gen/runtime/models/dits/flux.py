@@ -142,7 +142,12 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(self.inner_dim, self.out_dim, bias=out_bias)
+                ReplicatedLinear(
+                    self.inner_dim,
+                    self.out_dim,
+                    bias=out_bias,
+                    quant_config=quant_config,
+                )
             )
             if dropout != 0.0:
                 self.to_out.append(torch.nn.Dropout(dropout))
@@ -362,6 +367,7 @@ class FluxTransformerBlock(nn.Module):
             context_pre_only=False,
             bias=True,
             eps=eps,
+            quant_config=quant_config,
         )
 
         self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)

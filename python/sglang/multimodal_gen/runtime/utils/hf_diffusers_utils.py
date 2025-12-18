@@ -185,7 +185,7 @@ def get_quant_config(
         return quant_cls.from_config({})
 
     # Read the quantization config from the HF model config, if available.
-    hf_quant_config = getattr(model_config, "quantization_config", None)
+    hf_quant_config = model_config["quantization_config"]
     # some vision model may keep quantization_config in their text_config
     hf_text_config = getattr(model_config, "text_config", None)
     if hf_quant_config is None and hf_text_config is not None:
