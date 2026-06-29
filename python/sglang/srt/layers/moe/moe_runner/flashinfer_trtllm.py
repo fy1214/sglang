@@ -357,6 +357,9 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
 
     routing_method_type: int
 
+    # Per-token activation scaling (NVFP4 pertoken mode)
+    use_pertoken_scale: bool = False
+
 
 def quantize_hidden_states_fp4(
     hidden_states: torch.Tensor,
@@ -389,6 +392,37 @@ def quantize_hidden_states_fp4(
     return hs_fp4, hs_sf
 
 
+_NVFP4_BASE_SCALE_INV = 1.0 / (448.0 * 6.0)
+
+
+def quantize_hidden_states_fp4_pertoken(
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize hidden states to FP4 with per-token activation scaling.
+
+    Uses flashinfer's nvfp4_quantize with per_token_activation=True.
+    The base scale is a fixed constant 1/(FP8_MAX * FP4_MAX) = 1/(448*6).
+    Per-row scales are computed internally by the kernel.
+
+    Returns (packed_fp4_uint8, scale_float8_e4m3fn, per_token_scale_f32)
+    """
+    from flashinfer import nvfp4_quantize
+    from flashinfer.quantization.fp4_quantization import SfLayout
+
+    seq_len, hidden_size = hidden_states.shape
+    a_fp4, a_sf, per_token_scale = nvfp4_quantize(
+        a=hidden_states,
+        a_global_sf=_NVFP4_BASE_SCALE_INV,
+        sfLayout=SfLayout.layout_linear,
+        per_token_activation=True,
+    )
+
+    hs_fp4 = a_fp4.reshape(seq_len, hidden_size // 2)
+    hs_sf = a_sf.view(torch.float8_e4m3fn).reshape(seq_len, hidden_size // 16)
+
+    return hs_fp4, hs_sf, per_token_scale
+
+
 def fused_experts_none_to_flashinfer_trtllm_fp4(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferTrtllmFp4MoeQuantInfo,
@@ -417,9 +451,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     routing_method_type = quant_info.routing_method_type
 
     # Quantize hidden states to FP4
-    hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
-        hidden_states, quant_info.w13_input_scale_quant
-    )
+    per_token_scale = None
+    if quant_info.use_pertoken_scale:
+        hs_fp4, hs_scale_linear, per_token_scale = (
+            quantize_hidden_states_fp4_pertoken(hidden_states)
+        )
+    else:
+        hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
+            hidden_states, quant_info.w13_input_scale_quant
+        )
 
     # DeepSeekV3 style routing requires float32 router logits
     if routing_method_type == RoutingMethodType.DeepSeekV3:
@@ -476,6 +516,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             else RoutingMethodType.Default
         ),
         do_finalize=True,
+        per_token_scale=per_token_scale,
         tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
         output=symm_output,
     )[0]

@@ -1,6 +1,9 @@
 from typing import List, Union
 
+import torch
+
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -45,6 +48,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         self.IMAGE_END_TOKEN_ID = hf_config.image_end_token_id
         self.VIDEO_START_TOKEN_ID = hf_config.video_start_token_id
         self.VIDEO_END_TOKEN_ID = hf_config.video_end_token_id
+        self.IM_START_TOKEN_ID = self.IMAGE_START_TOKEN_ID
+        self.IM_END_TOKEN_ID = self.IMAGE_END_TOKEN_ID
 
         # Vision config
         self.IMAGE_FACTOR = 28
@@ -58,6 +63,36 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # Note: For GLM4v videos, it uses the video token before tokenization but uses image token after tokenization
             video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
+
+    def get_mm_data(self, prompt, embeddings, img_grid_thw):
+        input_ids, offsets = self.build_input_ids(prompt, img_grid_thw)
+        mm_items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=offsets,
+                precomputed_embeddings=embeddings,
+            )
+        ]
+
+        input_ids_tensor = torch.tensor(input_ids)
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
+            input_ids=input_ids_tensor.unsqueeze(0),
+            hf_config=self.hf_config,
+            image_grid_thw=img_grid_thw,
+            video_grid_thw=None,
+            attention_mask=None,
+        )
+        mrope_positions = mrope_positions.squeeze(1)
+
+        return {
+            "input_ids": input_ids,
+            "mm_items": mm_items,
+            "im_start_id": self.IM_START_TOKEN_ID,
+            "im_end_id": self.IM_END_TOKEN_ID,
+            "im_token_id": self.IM_TOKEN_ID,
+            "mrope_positions": mrope_positions,
+            "mrope_position_delta": mrope_position_delta,
+        }
 
     async def process_mm_data_async(
         self,

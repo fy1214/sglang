@@ -32,7 +32,10 @@ def _jit_apply_rope_pos_ids_cos_sin_cache_module() -> Module:
                 "ApplyRopePosIdsCosSinCacheKernel::run",
             )
         ],
-        extra_include_paths=[str(flashinfer_include_path)],
+        extra_include_paths=[
+            str(flashinfer_include_path),
+            str((flashinfer_dir / 'data' / 'cccl' / 'libcudacxx' / 'include').resolve()),
+        ],
     )
 
 
