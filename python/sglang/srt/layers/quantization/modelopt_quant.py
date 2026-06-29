@@ -1625,7 +1625,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 _copy_or_rebind_param(
                     layer,
                     "pertoken_g1_alphas",
-                    w13_weight_scale_2.to(torch.float32),
+                    w13_weight_scale_2.to(torch.float32).contiguous(),
                 )
                 _copy_or_rebind_param(
                     layer,
@@ -1705,7 +1705,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     hidden_size=hidden_size,
                 )  # k
 
-
             if NVFP4_PERTOKEN_SCALE:
                 w13_bs = layer.w13_blockscale_swizzled
                 w2_bs = layer.w2_blockscale_swizzled
@@ -1718,8 +1717,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     * layer.w13_weight.shape[1]
                 )
                 layer.w1_scale_offsets = (
-                    torch.arange(E + 1, dtype=torch.int64, device=device)
-                    * w1_sf_stride
+                    torch.arange(E + 1, dtype=torch.int64, device=device) * w1_sf_stride
                 )
 
                 w2_sf_stride = w2_bs.shape[1] * w2_bs.shape[2]
@@ -1729,14 +1727,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     * layer.w2_weight.shape[1]
                 )
                 layer.w2_scale_offsets = (
-                    torch.arange(E + 1, dtype=torch.int64, device=device)
-                    * w2_sf_stride
+                    torch.arange(E + 1, dtype=torch.int64, device=device) * w2_sf_stride
                 )
 
                 layer.w1_pertoken_wgt_scale = w13_weight_scale_2.to(torch.float32)
-                layer.w2_pertoken_wgt_scale = layer.w2_weight_scale_2.to(
-                    torch.float32
-                )
+                layer.w2_pertoken_wgt_scale = layer.w2_weight_scale_2.to(torch.float32)
 
         # Preallocate online-scale buffers to avoid cuda graph capture allocations.
         layer.nvfp4_online_w13_input_scale_quant = torch.empty_like(
@@ -1770,7 +1765,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             activation in ACT_STR_TO_TYPE_MAP
         ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
         moe_runner_config = self.moe_runner_config
-
 
         # NVFP4 per-token activation scaling via FlashInfer TRTLLM cubin
         if NVFP4_PERTOKEN_SCALE and self.enable_flashinfer_trtllm_moe:
@@ -1922,7 +1916,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
             return StandardCombineInput(hidden_states=output)
-
 
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
