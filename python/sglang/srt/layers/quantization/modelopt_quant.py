@@ -1443,6 +1443,44 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+        if NVFP4_PERTOKEN_SCALE:
+            device = w13_weight.device
+            E = layer.num_local_experts
+            w1_sf_stride = w13_weight_scale.shape[1] * w13_weight_scale.shape[2]
+            w2_sf_stride = w2_weight_scale.shape[1] * w2_weight_scale.shape[2]
+            layer.w1_blockscale_flat = Parameter(
+                torch.zeros(E * w1_sf_stride, dtype=torch.float8_e4m3fn, device=device),
+                requires_grad=False,
+            )
+            layer.w1_row_offsets = Parameter(
+                torch.zeros(E + 1, dtype=torch.int32, device=device),
+                requires_grad=False,
+            )
+            layer.w1_scale_offsets = Parameter(
+                torch.zeros(E + 1, dtype=torch.int64, device=device),
+                requires_grad=False,
+            )
+            layer.w2_blockscale_flat = Parameter(
+                torch.zeros(E * w2_sf_stride, dtype=torch.float8_e4m3fn, device=device),
+                requires_grad=False,
+            )
+            layer.w2_row_offsets = Parameter(
+                torch.zeros(E + 1, dtype=torch.int32, device=device),
+                requires_grad=False,
+            )
+            layer.w2_scale_offsets = Parameter(
+                torch.zeros(E + 1, dtype=torch.int64, device=device),
+                requires_grad=False,
+            )
+            layer.w1_pertoken_wgt_scale = Parameter(
+                torch.zeros(E, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+            layer.w2_pertoken_wgt_scale = Parameter(
+                torch.zeros(E, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP4 MoE weights after loading from serialized checkpoint.
 
@@ -1711,33 +1749,73 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 E = w13_bs.shape[0]
 
                 w1_sf_stride = w13_bs.shape[1] * w13_bs.shape[2]
-                layer.w1_blockscale_flat = w13_bs.reshape(-1).contiguous()
-                layer.w1_row_offsets = (
-                    torch.arange(E + 1, dtype=torch.int32, device=device)
-                    * layer.w13_weight.shape[1]
+                _copy_or_rebind_param(
+                    layer,
+                    "w1_blockscale_flat",
+                    w13_bs.reshape(-1).contiguous(),
                 )
-                layer.w1_scale_offsets = (
-                    torch.arange(E + 1, dtype=torch.int64, device=device) * w1_sf_stride
+                _copy_or_rebind_param(
+                    layer,
+                    "w1_row_offsets",
+                    (
+                        torch.arange(E + 1, dtype=torch.int32, device=device)
+                        * layer.w13_weight.shape[1]
+                    ),
+                )
+                _copy_or_rebind_param(
+                    layer,
+                    "w1_scale_offsets",
+                    (
+                        torch.arange(E + 1, dtype=torch.int64, device=device)
+                        * w1_sf_stride
+                    ),
                 )
 
                 w2_sf_stride = w2_bs.shape[1] * w2_bs.shape[2]
-                layer.w2_blockscale_flat = w2_bs.reshape(-1).contiguous()
-                layer.w2_row_offsets = (
-                    torch.arange(E + 1, dtype=torch.int32, device=device)
-                    * layer.w2_weight.shape[1]
+                _copy_or_rebind_param(
+                    layer,
+                    "w2_blockscale_flat",
+                    w2_bs.reshape(-1).contiguous(),
                 )
-                layer.w2_scale_offsets = (
-                    torch.arange(E + 1, dtype=torch.int64, device=device) * w2_sf_stride
+                _copy_or_rebind_param(
+                    layer,
+                    "w2_row_offsets",
+                    (
+                        torch.arange(E + 1, dtype=torch.int32, device=device)
+                        * layer.w2_weight.shape[1]
+                    ),
+                )
+                _copy_or_rebind_param(
+                    layer,
+                    "w2_scale_offsets",
+                    (
+                        torch.arange(E + 1, dtype=torch.int64, device=device)
+                        * w2_sf_stride
+                    ),
                 )
 
-                layer.w1_pertoken_wgt_scale = w13_weight_scale_2.to(torch.float32)
-                layer.w2_pertoken_wgt_scale = layer.w2_weight_scale_2.to(torch.float32)
+                _copy_or_rebind_param(
+                    layer,
+                    "w1_pertoken_wgt_scale",
+                    w13_weight_scale_2.to(torch.float32),
+                )
+                _copy_or_rebind_param(
+                    layer,
+                    "w2_pertoken_wgt_scale",
+                    layer.w2_weight_scale_2.to(torch.float32),
+                )
 
         # Preallocate online-scale buffers to avoid cuda graph capture allocations.
-        layer.nvfp4_online_w13_input_scale_quant = torch.empty_like(
-            layer.w13_input_scale_quant
+        _copy_or_rebind_param(
+            layer,
+            "nvfp4_online_w13_input_scale_quant",
+            torch.empty_like(layer.w13_input_scale_quant),
         )
-        layer.nvfp4_online_g1_alphas = torch.empty_like(layer.g1_alphas)
+        _copy_or_rebind_param(
+            layer,
+            "nvfp4_online_g1_alphas",
+            torch.empty_like(layer.g1_alphas),
+        )
 
     @property
     def load_up_proj_weight_first(self) -> bool:
