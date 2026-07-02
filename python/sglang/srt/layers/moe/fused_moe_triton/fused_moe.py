@@ -25,6 +25,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
+from ...quantization.modelopt_quant import NVFP4_PERTOKEN_SCALE
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
     act_and_mul_triton,
@@ -572,8 +573,7 @@ def fused_experts_impl(
         # --- FC2 input: apply probs + QDQ to match Megatron training ---
         # Megatron: SwiGLU -> x*probs -> NVFP4 quantize -> FC2
         # Without this block: SwiGLU -> FC2 -> x*probs (probs at FC2 output)
-        _NVFP4_FC2_QDQ = bool(int(os.getenv("SGLANG_NVFP4_FC2_QDQ", "0")))
-        if _NVFP4_FC2_QDQ:
+        if NVFP4_PERTOKEN_SCALE:
             from miniTransformer.ops.nvfp4_quantize import (
                 _get_fp4_grid,
                 dequantize_nvfp4_pertoken,
@@ -610,13 +610,6 @@ def fused_experts_impl(
             intermediate_cache2 = dequantize_nvfp4_pertoken(_qresult2).to(_orig_dtype2)[
                 :, :_k2
             ]
-
-            if not os.environ.get("_FC2_QDQ_LOGGED"):
-                print(
-                    f"[FC2_QDQ] hit! shape={intermediate_cache2.shape}, probs_applied={_fc2_probs_applied}",
-                    flush=True,
-                )
-                os.environ["_FC2_QDQ_LOGGED"] = "1"
         else:
             _fc2_probs_applied = False
 
