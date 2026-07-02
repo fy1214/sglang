@@ -569,6 +569,57 @@ def fused_experts_impl(
         else:
             raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
+        # --- FC2 input: apply probs + QDQ to match Megatron training ---
+        # Megatron: SwiGLU -> x*probs -> NVFP4 quantize -> FC2
+        # Without this block: SwiGLU -> FC2 -> x*probs (probs at FC2 output)
+        _NVFP4_FC2_QDQ = bool(int(os.getenv("SGLANG_NVFP4_FC2_QDQ", "0")))
+        if _NVFP4_FC2_QDQ:
+            from miniTransformer.ops.nvfp4_quantize import (
+                _get_fp4_grid,
+                dequantize_nvfp4_pertoken,
+                quantize_nvfp4_pertoken,
+            )
+
+            if not apply_router_weight_on_input:
+                intermediate_cache2 = intermediate_cache2 * curr_topk_weights.view(
+                    -1, 1
+                ).to(intermediate_cache2.dtype)
+                _fc2_probs_applied = True
+            else:
+                _fc2_probs_applied = False
+
+            _orig_dtype2 = intermediate_cache2.dtype
+            _m2, _k2 = intermediate_cache2.shape
+            _k2_pad = ((_k2 + 127) // 128) * 128
+            _get_fp4_grid(intermediate_cache2.device)
+            if _k2_pad != _k2:
+                _x2_pad = torch.zeros(
+                    _m2,
+                    _k2_pad,
+                    dtype=torch.bfloat16,
+                    device=intermediate_cache2.device,
+                )
+                _x2_pad[:, :_k2] = intermediate_cache2
+            else:
+                _x2_pad = (
+                    intermediate_cache2
+                    if intermediate_cache2.dtype == torch.bfloat16
+                    else intermediate_cache2.to(torch.bfloat16)
+                )
+            _qresult2 = quantize_nvfp4_pertoken(_x2_pad)
+            intermediate_cache2 = dequantize_nvfp4_pertoken(_qresult2).to(_orig_dtype2)[
+                :, :_k2
+            ]
+
+            if not os.environ.get("_FC2_QDQ_LOGGED"):
+                print(
+                    f"[FC2_QDQ] hit! shape={intermediate_cache2.shape}, probs_applied={_fc2_probs_applied}",
+                    flush=True,
+                )
+                os.environ["_FC2_QDQ_LOGGED"] = "1"
+        else:
+            _fc2_probs_applied = False
+
         invoke_fused_moe_kernel(
             intermediate_cache2,
             w2,
@@ -586,7 +637,7 @@ def fused_experts_impl(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            not apply_router_weight_on_input,
+            not apply_router_weight_on_input and not _fc2_probs_applied,
             1,
             down_config or config,
             compute_type=compute_type,
