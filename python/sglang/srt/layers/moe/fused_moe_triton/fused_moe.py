@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -25,7 +26,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
-from ...quantization.modelopt_quant import NVFP4_PERTOKEN_SCALE
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
     act_and_mul_triton,
@@ -573,7 +573,7 @@ def fused_experts_impl(
         # --- FC2 input: apply probs + QDQ to match Megatron training ---
         # Megatron: SwiGLU -> x*probs -> NVFP4 quantize -> FC2
         # Without this block: SwiGLU -> FC2 -> x*probs (probs at FC2 output)
-        if NVFP4_PERTOKEN_SCALE:
+        if envs.SGLANG_NVFP4_PERTOKEN_SCALE.get():
             from miniTransformer.ops.nvfp4_quantize import (
                 _get_fp4_grid,
                 dequantize_nvfp4_pertoken,

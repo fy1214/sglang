@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -22,7 +23,6 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.modelopt_quant import NVFP4_PERTOKEN_SCALE
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -244,7 +244,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
-        if NVFP4_PERTOKEN_SCALE:
+        if envs.SGLANG_NVFP4_PERTOKEN_SCALE.get():
             from transformer_engine.pytorch import NVFP4Quantizer
 
             nvfp4_quantizer = NVFP4Quantizer(
@@ -378,7 +378,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
-        if NVFP4_PERTOKEN_SCALE:
+        if envs.SGLANG_NVFP4_PERTOKEN_SCALE.get():
             from miniTransformer.ops.nvfp4_quantize import (
                 _get_fp4_grid,
                 dequantize_nvfp4_pertoken,
