@@ -58,7 +58,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
+from sglang.srt.layers.quantization.modelopt_quant import (
+    NVFP4_PERTOKEN_SCALE,
+    ModelOptNvFp4FusedMoEMethod,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args
@@ -1269,6 +1272,7 @@ class FlashInferFP4MoE(FusedMoE):
     def _quantize_hidden_states_fp4_pertoken(self, hidden_states: torch.Tensor):
         from flashinfer import nvfp4_quantize
         from flashinfer.quantization.fp4_quantization import SfLayout
+
         seq_len, hidden_size = hidden_states.shape
         a_fp4, a_sf, per_token_scale = nvfp4_quantize(
             hidden_states,
@@ -1313,15 +1317,18 @@ class FlashInferFP4MoE(FusedMoE):
 
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
+        if (
+            NVFP4_PERTOKEN_SCALE
+            and get_moe_runner_backend().is_flashinfer_trtllm()
+            and hasattr(self, "gemm1_weights_fp4_shuffled")
+            and hasattr(self, "pertoken_g1_scale_c")
+        ):
+            return FusedMoE.forward_impl(self, hidden_states, topk_output)
+
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
 
-        import os
-        _per_token_scale = None
-        if os.environ.get("SGLANG_NVFP4_PERTOKEN_SCALE", "0") == "1" and hasattr(self, "pertoken_g1_scale_c"):
-            hs_fp4, hs_scale_linear, _per_token_scale = self._quantize_hidden_states_fp4_pertoken(hidden_states)
-        else:
-            hs_fp4, hs_scale_linear = self._quantize_hidden_states_fp4(hidden_states)
+        hs_fp4, hs_scale_linear = self._quantize_hidden_states_fp4(hidden_states)
         routing_method_type = self.routing_method_type
         assert (
             routing_method_type is not None
@@ -1369,9 +1376,9 @@ class FlashInferFP4MoE(FusedMoE):
                 torch.float8_e4m3fn
             ),
             gemm2_bias=None,
-            output1_scale_scalar=self.pertoken_g1_scale_c.data if _per_token_scale is not None else self.g1_scale_c.data,
-            output1_scale_gate_scalar=self.pertoken_g1_alphas.data if _per_token_scale is not None else self.g1_alphas.data,
-            output2_scale_scalar=self.pertoken_g2_alphas.data if _per_token_scale is not None else self.g2_alphas.data,
+            output1_scale_scalar=self.g1_scale_c.data,
+            output1_scale_gate_scalar=self.g1_alphas.data,
+            output2_scale_scalar=self.g2_alphas.data,
             num_experts=self.num_experts,
             top_k=topk_config.top_k,
             n_group=topk_config.num_expert_group,
@@ -1388,7 +1395,7 @@ class FlashInferFP4MoE(FusedMoE):
                 else RoutingMethodType.Default
             ),
             do_finalize=True,
-            per_token_scale=_per_token_scale,
+            per_token_scale=None,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             output=symm_output,
         )[0]
