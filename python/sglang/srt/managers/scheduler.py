@@ -1514,7 +1514,13 @@ class Scheduler(
                 custom_logit_processor=recv_req.custom_logit_processor,
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
-                return_routed_experts=recv_req.return_routed_experts,
+                # [INFIX-R3] sglang_router 0.3.2's typed /generate
+                # schema drops return_routed_experts.  The server-level flag is
+                # an explicit R3 opt-in, so use it as the authoritative fallback.
+                return_routed_experts=(
+                    recv_req.return_routed_experts
+                    or self.server_args.enable_return_routed_experts
+                ),
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
