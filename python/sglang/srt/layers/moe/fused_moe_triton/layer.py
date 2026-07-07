@@ -1284,21 +1284,33 @@ class FlashInferFP4MoE(FusedMoE):
         hs_sf = a_sf.view(torch.float8_e4m3fn).reshape(seq_len, hidden_size // 16)
         return hs_fp4, hs_sf, per_token_scale
 
+    @staticmethod
+    def _accepts_topk_output(topk_output: TopKOutput) -> bool:
+        if TopKOutputChecker.format_is_bypassed(topk_output):
+            return True
+        return (
+            TopKOutputChecker.format_is_standard(topk_output)
+            and get_global_server_args().enable_return_routed_experts
+        )
+
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        assert TopKOutputChecker.format_is_bypassed(
-            topk_output
-        ), "Only bypassed topk output is supported for flashinfer fp4 moe"
+        assert self._accepts_topk_output(topk_output), (
+            "Only bypassed topk output is supported for flashinfer fp4 moe, "
+            "unless --enable-return-routed-experts is set"
+        )
 
         if is_in_piecewise_cuda_graph():
-            return flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
-                hidden_states,
-                topk_output.router_logits,
-                topk_output.topk_config.top_k,
-                topk_output.topk_config.topk_group,
-                topk_output.topk_config.num_expert_group,
-                topk_output.topk_config.correction_bias,
-                self.layer_id,
-            )
+            if TopKOutputChecker.format_is_bypassed(topk_output):
+                return flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
+                    hidden_states,
+                    topk_output.router_logits,
+                    topk_output.topk_config.top_k,
+                    topk_output.topk_config.topk_group,
+                    topk_output.topk_config.num_expert_group,
+                    topk_output.topk_config.correction_bias,
+                    self.layer_id,
+                )
+            return self.forward_impl(hidden_states, topk_output)
         else:
             return self.forward_impl(hidden_states, topk_output)
 
@@ -1307,15 +1319,13 @@ class FlashInferFP4MoE(FusedMoE):
 
         Args:
             hidden_states: Input tensor
-            topk_output: TopKOutput object with Bypassed format
+            topk_output: TopKOutput object with Bypassed or Standard (R3) format
         """
         assert isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
 
         assert (
             self.moe_runner_config.is_gated
         ), "Only gated MoEs are supported for flashinfer fp4 moe"
-
-        assert TopKOutputChecker.format_is_bypassed(topk_output)
 
         if (
             NVFP4_PERTOKEN_SCALE
@@ -1324,6 +1334,8 @@ class FlashInferFP4MoE(FusedMoE):
             and hasattr(self, "pertoken_g1_scale_c")
         ):
             return FusedMoE.forward_impl(self, hidden_states, topk_output)
+
+        assert TopKOutputChecker.format_is_bypassed(topk_output)
 
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
