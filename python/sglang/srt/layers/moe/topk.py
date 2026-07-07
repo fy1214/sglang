@@ -49,6 +49,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -281,10 +282,14 @@ class TopK(MultiPlatformOp):
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
-        elif (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_mxfp4()
-        ):
+        elif get_moe_runner_backend().is_flashinfer_trtllm():
+            # R3 needs materialized topk_ids for routed-experts capture. Keep the
+            # fused bypassed path when rollout routing replay is disabled.
+            if get_global_server_args().enable_return_routed_experts:
+                output_format = TopKOutputFormat.STANDARD
+            else:
+                output_format = TopKOutputFormat.BYPASSED
+        elif get_moe_runner_backend().is_flashinfer_mxfp4():
             output_format = TopKOutputFormat.BYPASSED
         else:
             output_format = TopKOutputFormat.STANDARD
