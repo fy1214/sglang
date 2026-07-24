@@ -1826,6 +1826,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if get_moe_runner_backend().is_flashinfer_trtllm():
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
+            )
 
     def apply(
         self,
@@ -1896,12 +1900,36 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ).to(x.dtype)
             return StandardCombineInput(hidden_states=output)
 
-        # Check if this is a FlashInferFP4MoE layer that should handle its own forward
+        # FlashInfer TRTLLM FP4 path - layer has shuffled weights only when
+        # backend is flashinfer_trtllm
         if hasattr(layer, "gemm1_weights_fp4_shuffled"):
-            # This layer was processed with flashinfer TRTLLM - delegate to its own forward
-            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                FlashInferTrtllmFp4MoeQuantInfo,
+            )
+            from sglang.srt.layers.moe.utils import RoutingMethodType
 
-            return StandardCombineInput(hidden_states=layer.forward(x, topk_output))
+            # Determine routing method type based on layer configuration
+            routing_method_type = getattr(
+                layer, "routing_method_type", RoutingMethodType.Default
+            )
+
+            quant_info = FlashInferTrtllmFp4MoeQuantInfo(
+                gemm1_weights_fp4_shuffled=layer.gemm1_weights_fp4_shuffled.data,
+                gemm2_weights_fp4_shuffled=layer.gemm2_weights_fp4_shuffled.data,
+                gemm1_scales_fp4_shuffled=layer.gemm1_scales_fp4_shuffled.data,
+                gemm2_scales_fp4_shuffled=layer.gemm2_scales_fp4_shuffled.data,
+                g1_scale_c=layer.g1_scale_c.data,
+                g1_alphas=layer.g1_alphas.data,
+                g2_alphas=layer.g2_alphas.data,
+                w13_input_scale_quant=layer.w13_input_scale_quant,
+                global_num_experts=layer.num_experts,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                local_num_experts=layer.num_local_experts,
+                intermediate_size_per_partition=layer.intermediate_size_per_partition,
+                routing_method_type=routing_method_type,
+            )
+
+            return self.runner.run(dispatch_output, quant_info)
 
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
