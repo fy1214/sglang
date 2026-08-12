@@ -386,6 +386,11 @@ class SchedulerBatchResultProcessor:
                 logits_output.next_token_token_ids_logprobs_val = [
                     v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
                 ]
+            if logits_output.next_token_top_p_token_ids:
+                logits_output.next_token_top_p_token_ids = [
+                    v.tolist() if torch.is_tensor(v) else v
+                    for v in logits_output.next_token_top_p_token_ids
+                ]
 
     def _apply_prefill_logprobs(
         self,
@@ -766,6 +771,11 @@ class SchedulerBatchResultProcessor:
                 logits_output.next_token_token_ids_logprobs_val = [
                     v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
                 ]
+            if logits_output.next_token_top_p_token_ids:
+                logits_output.next_token_top_p_token_ids = [
+                    v.tolist() if torch.is_tensor(v) else v
+                    for v in logits_output.next_token_top_p_token_ids
+                ]
         return next_token_ids, next_token_logprobs
 
     def _apply_decode_logprobs(
@@ -808,6 +818,14 @@ class SchedulerBatchResultProcessor:
                 req.logprob.output_token_ids_logprobs_idx.append(
                     logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                 )
+            if logits_output.next_token_top_p_token_ids:
+                row_top_p_token_ids = logits_output.next_token_top_p_token_ids[
+                    i * max_accept + j
+                ]
+                if row_top_p_token_ids is not None:
+                    if torch.is_tensor(row_top_p_token_ids):
+                        row_top_p_token_ids = row_top_p_token_ids.tolist()
+                    req.logprob.output_top_p_token_ids.append(row_top_p_token_ids)
 
     def _handle_finish_state_updated_req(
         self,

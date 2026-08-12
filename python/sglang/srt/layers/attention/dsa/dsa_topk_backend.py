@@ -229,6 +229,15 @@ def _topk_unfused(
     topk_local_indices = topk_local_indices.masked_fill(
         topk_scores == float("-inf"), -1
     )
+    if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        invalid_sort_key = torch.iinfo(torch.int32).max
+        topk_local_indices = torch.sort(
+            topk_local_indices.masked_fill(topk_local_indices < 0, invalid_sort_key),
+            dim=-1,
+        ).values
+        topk_local_indices = topk_local_indices.masked_fill(
+            topk_local_indices == invalid_sort_key, -1
+        )
     topk_indices[:, :valid_topk] = topk_local_indices
 
     return topk_indices

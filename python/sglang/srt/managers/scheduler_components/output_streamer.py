@@ -297,6 +297,7 @@ class _GenerationStreamAccumulator:
     input_token_ids_logprobs_idx: Optional[list] = None
     output_token_ids_logprobs_val: Optional[list] = None
     output_token_ids_logprobs_idx: Optional[list] = None
+    output_top_p_token_ids: Optional[list] = None
 
     def __post_init__(self) -> None:
         if self.return_hidden_states:
@@ -319,6 +320,7 @@ class _GenerationStreamAccumulator:
             self.input_token_ids_logprobs_idx = []
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
+            self.output_top_p_token_ids = []
 
     def accept(self, *, req: Req) -> None:
         if req.finished():
@@ -472,6 +474,11 @@ class _GenerationStreamAccumulator:
                         send_output_token_logprobs_offset:logprob_end
                     ]
                 )
+                self.output_top_p_token_ids.append(
+                    req.logprob.output_top_p_token_ids[
+                        send_output_token_logprobs_offset:logprob_end
+                    ]
+                )
                 req.send_output_token_logprobs_offset = logprob_end
             else:
                 self.output_token_logprobs_val.append([])
@@ -480,6 +487,7 @@ class _GenerationStreamAccumulator:
                 self.output_top_logprobs_idx.append([])
                 self.output_token_ids_logprobs_val.append([])
                 self.output_token_ids_logprobs_idx.append([])
+                self.output_top_p_token_ids.append([])
 
         if self.return_hidden_states:
             if req.return_hidden_states:
@@ -558,6 +566,7 @@ class _GenerationStreamAccumulator:
             input_token_ids_logprobs_idx=self.input_token_ids_logprobs_idx,
             output_token_ids_logprobs_val=self.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
+            output_top_p_token_ids=self.output_top_p_token_ids,
             output_token_entropy_val=None,
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,

@@ -1189,6 +1189,7 @@ TopLogprobValues = Optional[List[Optional[List[Optional[List[float]]]]]]
 TopLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 TokenIdsLogprobValues = Optional[List[Optional[List[Optional[List[float]]]]]]
 TokenIdsLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
+TopPTokenIds = Optional[List[Optional[List[Optional[List[int]]]]]]
 HiddenStateChunk = List[Optional[Union[float, List[float]]]]
 OutputHiddenStates = Optional[List[Optional[List[HiddenStateChunk]]]]
 CachedTokensDetails = Dict[str, Union[int, str]]
@@ -1229,6 +1230,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_token_ids_logprobs_idx: TokenIdsLogprobIndices
     output_token_ids_logprobs_val: TokenIdsLogprobValues
     output_token_ids_logprobs_idx: TokenIdsLogprobIndices
+    output_top_p_token_ids: TopPTokenIds
     output_token_entropy_val: Optional[List[Optional[float]]]
 
     # Hidden states
@@ -1305,6 +1307,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_token_ids_logprobs_idx: TokenIdsLogprobIndices
     output_token_ids_logprobs_val: TokenIdsLogprobValues
     output_token_ids_logprobs_idx: TokenIdsLogprobIndices
+    output_top_p_token_ids: TopPTokenIds
     output_token_entropy_val: Optional[List[Optional[float]]]
 
     # Hidden states
@@ -1715,6 +1718,16 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
     pass
 
 
+class PostProcessWeightsReqInput(BaseReq, kw_only=True):
+    restore_weights_before_load: bool = False
+    post_process_quantization: bool = False
+
+
+class PostProcessWeightsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
     allow_quant_error: bool = False
@@ -1724,6 +1737,22 @@ class CheckWeightsReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
     payload: Optional[Dict[str, Any]] = None
+
+
+class PullWeightsReqInput(BaseReq, kw_only=True):
+    # Host-local checkpoint dir the pulled weights land in; seeded from the
+    # server's model path when the published stream has no full version.
+    local_checkpoint_dir: str
+    # Shared dir the publisher writes weight_v{N:06d}/ version dirs under; each
+    # version is a full HF checkpoint or a delta against the previous version.
+    source_dir: str
+    # The version to bring the local checkpoint up to.
+    target_version: int
+
+
+class PullWeightsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
 
 
 class SlowDownReqInput(BaseReq, kw_only=True):
@@ -2030,7 +2059,7 @@ class GetLoadsReqInput(BaseReq, kw_only=True):
     """Request for /v1/loads endpoint."""
 
     VALID_SECTIONS = frozenset(
-        {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
+        {"core", "memory", "spec", "lora", "disagg", "queues", "inflight", "all"}
     )
 
     include: List[str] = msgspec.field(default_factory=lambda: ["all"])
@@ -2074,6 +2103,9 @@ class GetLoadsReqOutput(BaseReq, kw_only=True):
     lora: Optional[LoRAMetrics] = None
     disaggregation: Optional[DisaggregationMetrics] = None
     queues: Optional[QueueMetrics] = None
+    # Per-request breakdown of every queue, only populated when "inflight" or
+    # "all" is requested.
+    inflight: Optional[List[Dict[str, Any]]] = None
 
 
 class SetInjectDumpMetadataReqInput(BaseReq, kw_only=True):

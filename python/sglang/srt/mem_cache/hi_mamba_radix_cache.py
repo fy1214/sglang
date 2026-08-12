@@ -207,6 +207,19 @@ class HiMambaRadixCache(MambaRadixCache):
         )
         super().reset()
 
+    def release_memory_occupation(self) -> None:
+        if self.enable_storage:
+            logger.warning(
+                "Skipping HiCache host memory release while storage backend is enabled."
+            )
+            return
+        self.host_pool_group.release_memory_occupation()
+
+    def resume_memory_occupation(self) -> None:
+        if self.enable_storage:
+            return
+        self.host_pool_group.resume_memory_occupation()
+
     def write_backup(self, node: TreeNode, write_back=False) -> int:
         # Backup invariant (for write-through mode): backed-up nodes must form a
         # contiguous prefix from root — no gaps.  Skip if parent isn't backed

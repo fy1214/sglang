@@ -127,7 +127,9 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PostProcessWeightsReqInput,
     ProfileReq,
+    PullWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -686,10 +688,8 @@ async def model_info():
 @app.get("/weight_version")
 async def weight_version():
     """Get the current weight version."""
-    raise HTTPException(
-        status_code=404,
-        detail="Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead.",
-    )
+    result = await model_info()
+    return {"weight_version": result.get("weight_version", None)}
 
 
 @app.get("/get_server_info")
@@ -706,9 +706,18 @@ async def get_server_info():
 async def server_info():
     """Get the server information."""
     # Returns internal states per DP.
-    internal_states: List[Dict[Any, Any]] = (
-        await _global_state.tokenizer_manager.get_internal_state()
-    )
+    server_info_timeout = float(os.environ.get("SGLANG_SERVER_INFO_TIMEOUT", "2"))
+    try:
+        internal_states: List[Dict[Any, Any]] = await asyncio.wait_for(
+            _global_state.tokenizer_manager.get_internal_state(),
+            timeout=server_info_timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Timed out getting internal state for /server_info after %.1fs; returning empty internal_states",
+            server_info_timeout,
+        )
+        internal_states = []
 
     server_args = _global_state.tokenizer_manager.server_args
 
@@ -1320,6 +1329,33 @@ async def update_weights_from_ipc(
         return ORJSONResponse(content)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/post_process_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def post_process_weights(req: PostProcessWeightsReqInput, request: Request):
+    """Optional post-processing for updated weights, e.g. quantization packing."""
+    success, message = await _global_state.tokenizer_manager.post_process_weights(
+        req, request
+    )
+
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/pull_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pull_weights(obj: Annotated[PullWeightsReqInput, Body()], request: Request):
+    """Have every host of this deployment pull published weight deltas into its
+    local checkpoint (materialized from the model path on first use)."""
+    success, message = await _global_state.tokenizer_manager.pull_weights(obj, request)
+
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.post("/update_weight_version")

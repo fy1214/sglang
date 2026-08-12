@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from sgl_kernel import silu_and_mul
 from sgl_kernel.test_utils import (
     assert_all_close_or_tiny_diff,
     create_per_token_group_quant_test_data,
@@ -21,6 +22,62 @@ from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+
+
+def test_masked_fused_silu_quant_matches_contiguous_sm90():
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("This test covers the Hopper train-rollout alignment path")
+
+    torch.manual_seed(20260806)
+    num_experts, max_tokens, hidden_dim, group_size = 4, 128, 2048, 128
+    masked_m = torch.tensor([1, 17, 64, 127], device="cuda", dtype=torch.int32)
+    gate_up = torch.randn(
+        num_experts,
+        max_tokens,
+        hidden_dim * 2,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    gate_up[1, 3, :256] *= 7
+
+    fused_q, fused_s = sglang_per_token_group_quant_8bit(
+        x=gate_up,
+        group_size=group_size,
+        dst_dtype=torch.float8_e4m3fn,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=False,
+        fuse_silu_and_mul=True,
+        masked_m=masked_m,
+        enable_v2=True,
+    )
+
+    for expert, count in enumerate(masked_m.cpu().tolist()):
+        activated = silu_and_mul(gate_up[expert, :count].contiguous())
+        reference_q, reference_s = sglang_per_token_group_quant_8bit(
+            x=activated,
+            group_size=group_size,
+            dst_dtype=torch.float8_e4m3fn,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=False,
+            fuse_silu_and_mul=False,
+            masked_m=None,
+            enable_v2=False,
+        )
+        torch.testing.assert_close(
+            fused_q[expert, :count].view(torch.uint8),
+            reference_q.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            fused_s[expert, :count],
+            reference_s,
+            rtol=0,
+            atol=0,
+        )
+
 
 configs = list(
     itertools.product(

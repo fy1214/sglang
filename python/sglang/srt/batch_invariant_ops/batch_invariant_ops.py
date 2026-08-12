@@ -214,7 +214,7 @@ def _matmul_persistent_triton(
             "num_warps": 8,
         },
         torch.float32: {
-            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_M": 16 if M <= 16 else 128,
             "BLOCK_SIZE_N": 128,
             "BLOCK_SIZE_K": 32,
             "GROUP_SIZE_M": 8,
@@ -313,6 +313,68 @@ def matmul_persistent(
         return out
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias)
+
+
+def router_gemm_batch_invariant(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+) -> torch.Tensor:
+    """BF16 router GEMM with a fixed K reduction and FP32 logits."""
+    if hidden_states.ndim != 2 or router_weight.ndim != 2:
+        raise ValueError(
+            "router_gemm_batch_invariant expects 2D tensors, got "
+            f"{hidden_states.shape=} and {router_weight.shape=}"
+        )
+    if hidden_states.shape[1] != router_weight.shape[1]:
+        raise ValueError(
+            "Incompatible router dimensions: "
+            f"{hidden_states.shape=} and {router_weight.shape=}"
+        )
+
+    supported_shape = (router_weight.shape[0], router_weight.shape[1]) in {
+        (160, 5120),
+        (256, 6144),
+        (256, 7168),
+        (384, 7168),
+    }
+    use_fast_kernel = (
+        hidden_states.is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and router_weight.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+        and router_weight.is_contiguous()
+        and supported_shape
+        and torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+    )
+    if not use_fast_kernel:
+        return matmul_persistent(
+            hidden_states.to(torch.float32),
+            router_weight.to(torch.float32).t(),
+        )
+
+    if (router_weight.shape[0], router_weight.shape[1]) == (256, 6144):
+        from sglang.jit_kernel.glm5_router_gemm import (
+            glm5_router_gemm as fast_router_gemm,
+        )
+    else:
+        from sgl_kernel import dsv3_router_gemm
+
+        def fast_router_gemm(input_chunk, weight):
+            return dsv3_router_gemm(input_chunk, weight, out_dtype=torch.float32)
+
+    if hidden_states.shape[0] == 0:
+        return torch.empty(
+            (0, router_weight.shape[0]),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+
+    chunk_size = 16
+    chunks = [
+        fast_router_gemm(hidden_states[start : start + chunk_size], router_weight)
+        for start in range(0, hidden_states.shape[0], chunk_size)
+    ]
+    return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
 
 
 @triton.jit

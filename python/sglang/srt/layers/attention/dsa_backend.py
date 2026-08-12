@@ -20,7 +20,10 @@ from sglang.srt.runtime_context import get_parallel
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.srt.layers.attention.dsa.dequant_k_cache import (
+    dequantize_k_cache,
+    dequantize_k_cache_paged,
+)
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
@@ -72,6 +75,45 @@ from sglang.srt.utils import (
 # concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
+
+
+def _quantize_dequantize_fp8_sparse_kv(kv: torch.Tensor) -> torch.Tensor:
+    """Round fresh MLA KV through the packed FP8 cache representation."""
+
+    if kv.shape[-2:] != (1, 576):
+        raise ValueError(
+            "FP8 sparse MLA expects KV shaped [..., 1, 576], " f"got {tuple(kv.shape)}"
+        )
+    num_tokens = kv.numel() // 576
+    packed = quantize_k_cache(kv.reshape(num_tokens, 1, 1, 576))
+    return dequantize_k_cache(packed).reshape(num_tokens, 1, 576)
+
+
+def _dequantize_fp8_sparse_paged_kv(
+    kv_cache: torch.Tensor,
+    page_table_1: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gather selected FP8 KV and remap indices to the compact BF16 copy."""
+
+    if page_table_1.ndim != 2:
+        raise ValueError(
+            "FP8 sparse MLA expects a two-dimensional page table, "
+            f"got shape {tuple(page_table_1.shape)}"
+        )
+    safe_physical_indices = page_table_1.clamp_min(0).contiguous().view(-1)
+    dequantized_kv = dequantize_k_cache_paged(kv_cache, safe_physical_indices)
+    compact_indices = torch.arange(
+        page_table_1.numel(),
+        dtype=torch.int32,
+        device=page_table_1.device,
+    ).view_as(page_table_1)
+    compact_indices = torch.where(
+        page_table_1 >= 0,
+        compact_indices,
+        torch.full_like(compact_indices, -1),
+    )
+    return dequantized_kv, compact_indices
+
 
 if is_cuda():
     import deep_gemm
@@ -1997,7 +2039,13 @@ class DeepseekSparseAttnBackend(
                     )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
+                    if self.dsa_kv_cache_store_fp8:
+                        kv_cache = _quantize_dequantize_fp8_sparse_kv(kv_cache)
                 page_table_1 = topk_indices
+            elif self.dsa_kv_cache_store_fp8:
+                kv_cache, page_table_1 = _dequantize_fp8_sparse_paged_kv(
+                    kv_cache, page_table_1
+                )
 
             return self._forward_flashmla_sparse(
                 q_all=q_all,
@@ -2142,6 +2190,10 @@ class DeepseekSparseAttnBackend(
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self.dsa_kv_cache_store_fp8:
+                kv_cache, page_table_1 = _dequantize_fp8_sparse_paged_kv(
+                    kv_cache, page_table_1
+                )
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,

@@ -131,6 +131,32 @@ def _resolve_kernel_path() -> pathlib.Path:
 
 
 KERNEL_PATH = _resolve_kernel_path()
+
+
+def _extra_kernel_roots() -> List[pathlib.Path]:
+    """Additional kernel roots (each with a ``csrc/`` subdir) searched after
+    sglang's own tree, from ``$SGLANG_JIT_KERNEL_EXTRA_PATH`` (os.pathsep-
+    separated). Lets a downstream package (e.g. slime) host custom ``.cuh``
+    sources and have sglang's JIT try-cache compile them, without sglang
+    importing that package."""
+    raw = os.environ.get("SGLANG_JIT_KERNEL_EXTRA_PATH", "")
+    return [pathlib.Path(p).expanduser().resolve() for p in raw.split(os.pathsep) if p]
+
+
+def _resolve_source_file(rel: str) -> str:
+    """Resolve a ``csrc``-relative source file: sglang's own tree first, then
+    any extra kernel roots. Falls back to sglang's path (a later compile step
+    then raises with a clear location)."""
+    primary = (KERNEL_PATH / "csrc" / rel).resolve()
+    if primary.is_file():
+        return str(primary)
+    for root in _extra_kernel_roots():
+        candidate = (root / "csrc" / rel).resolve()
+        if candidate.is_file():
+            return str(candidate)
+    return str(primary)
+
+
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
@@ -261,8 +287,8 @@ def load_jit(
     extra_ldflags = extra_ldflags or []
     extra_include_paths = extra_include_paths or []
 
-    cpp_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cpp_files]
-    cuda_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cuda_files]
+    cpp_files = [_resolve_source_file(f) for f in cpp_files]
+    cuda_files = [_resolve_source_file(f) for f in cuda_files]
 
     for dep in set(extra_dependencies or []):
         if dep not in _REGISTERED_DEPENDENCIES:

@@ -212,6 +212,88 @@ class SchedulerLoadInquirer:
                 retracted=self.get_stats().num_retracted_reqs,
             )
 
+        inflight = None
+        if include_all or "inflight" in include:
+            now_perf = time.perf_counter()
+            inflight_queues = [("running", self.get_running_batch().reqs, None)]
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                inflight_queues += [
+                    ("waiting", self.get_waiting_queue(), "wait_queue_entry_time"),
+                    (
+                        "bootstrap",
+                        self.get_disagg_prefill_bootstrap_queue().queue,
+                        "prefill_bootstrap_queue_entry_time",
+                    ),
+                    (
+                        "prefill_inflight",
+                        self.get_disagg_prefill_inflight_queue(),
+                        "prefill_transfer_queue_entry_time",
+                    ),
+                ]
+            elif self.disaggregation_mode == DisaggregationMode.DECODE:
+                inflight_queues += [
+                    ("waiting", self.get_waiting_queue(), "wait_queue_entry_time"),
+                    (
+                        "prealloc",
+                        self.get_disagg_decode_prealloc_queue().queue,
+                        "decode_prealloc_queue_entry_time",
+                    ),
+                    (
+                        "transfer",
+                        self.get_disagg_decode_transfer_queue().queue,
+                        "decode_transfer_queue_entry_time",
+                    ),
+                    (
+                        "retracted",
+                        self.get_disagg_decode_prealloc_queue().retracted_queue,
+                        "decode_prealloc_queue_entry_time",
+                    ),
+                ]
+            else:
+                inflight_queues.append(
+                    ("waiting", self.get_waiting_queue(), "wait_queue_entry_time")
+                )
+
+            def describe_req(entry, stage, entry_time_field):
+                req = getattr(entry, "req", entry)
+                info = {
+                    "rid": getattr(req, "rid", None),
+                    "bootstrap_room": getattr(req, "bootstrap_room", None),
+                    "seqlen": getattr(entry, "seqlen", None),
+                    "stage": stage,
+                }
+                if entry_time_field is not None:
+                    time_stats = getattr(req, "time_stats", None)
+                    entry_time = (
+                        getattr(time_stats, entry_time_field, 0.0)
+                        if time_stats
+                        else 0.0
+                    )
+                    info["age_s"] = (
+                        round(now_perf - entry_time, 3) if entry_time else None
+                    )
+                if entry is not req:
+                    info["waiting_for_input"] = getattr(
+                        entry, "waiting_for_input", None
+                    )
+                    info["timeout_cancel_issued"] = getattr(
+                        entry, "timeout_cancel_issued", None
+                    )
+                return info
+
+            inflight = []
+            for name, queue, entry_time_field in inflight_queues:
+                inflight.append(
+                    {
+                        "name": name,
+                        "num_reqs": len(queue),
+                        "reqs": [
+                            describe_req(entry, name, entry_time_field)
+                            for entry in queue
+                        ],
+                    }
+                )
+
         return GetLoadsReqOutput(
             dp_rank=self.ps.dp_rank,
             timestamp=time.time(),
@@ -231,4 +313,5 @@ class SchedulerLoadInquirer:
             lora=lora,
             disaggregation=disaggregation,
             queues=queues,
+            inflight=inflight,
         )

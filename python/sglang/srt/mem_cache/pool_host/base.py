@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import abc
+import ctypes
+import ctypes.util
+import gc
 import logging
 import threading
 from functools import wraps
@@ -23,6 +26,27 @@ _is_hip = is_hip()
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
+
+try:
+    _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+    _libc.malloc_trim.argtypes = [ctypes.c_size_t]
+    _libc.malloc_trim.restype = ctypes.c_int
+except (AttributeError, OSError):
+    _libc = None
+
+
+def _iter_tensors(value):
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_tensors(item)
+
+
+def _trim_host_allocator() -> None:
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
@@ -120,9 +144,21 @@ class HostKVCache(abc.ABC):
                 device_pool.size,
             )
 
-        # Verify there is enough available host memory.
+        self._check_host_memory_available()
+
+        self.lock = threading.RLock()
+        self._host_memory_released = False
+        self._init_host_buffers()
+
+        # A lock for synchronized operations on memory allocation and state transitions.
+        self.clear()
+
+    def _requested_host_memory_bytes(self) -> int:
+        return self.size * self.size_per_token
+
+    def _check_host_memory_available(self) -> None:
         host_mem = psutil.virtual_memory()
-        requested_bytes = self.size * self.size_per_token
+        requested_bytes = self._requested_host_memory_bytes()
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
         if requested_bytes > available_bytes:
             raise ValueError(
@@ -131,15 +167,73 @@ class HostKVCache(abc.ABC):
                 f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
                 f"size of the hierarchical cache."
             )
-        else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
-            )
+        logger.info(
+            f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+        )
 
+    def _init_host_buffers(self) -> None:
         self.kv_buffer = self.init_kv_buffer()
 
-        # A lock for synchronized operations on memory allocation and state transitions.
-        self.lock = threading.RLock()
+    def _post_init_host_buffers(self) -> None:
+        pass
+
+    def _host_buffer_attr_names(self):
+        return ("kv_buffer",)
+
+    def _host_derived_attr_names(self):
+        return (
+            "k_data_refs",
+            "v_data_refs",
+            "k_data_ptrs",
+            "v_data_ptrs",
+            "data_refs",
+            "data_ptrs",
+            "index_k_data_refs",
+            "index_k_data_ptrs",
+        )
+
+    def _release_host_buffers(self) -> None:
+        seen_ptrs = set()
+        for attr in self._host_derived_attr_names():
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        for attr in self._host_buffer_attr_names():
+            value = getattr(self, attr, None)
+            if value is not None and self.pin_memory and (_is_cuda or _is_hip):
+                for tensor in _iter_tensors(value):
+                    ptr = tensor.data_ptr()
+                    if ptr and ptr not in seen_ptrs:
+                        seen_ptrs.add(ptr)
+                        _cuda_host_unregister(tensor)
+            setattr(self, attr, None)
+
+    @synchronized
+    def release_memory_occupation(self) -> None:
+        if not hasattr(self, "_host_memory_released"):
+            return
+        if self._host_memory_released:
+            return
+        self._release_host_buffers()
+        self.mem_state = torch.empty((0,), dtype=torch.uint8, device=self.device)
+        self.free_slots = torch.empty((0,), dtype=torch.int64)
+        self.slot_used = torch.empty((0,), dtype=torch.bool)
+        self._host_memory_released = True
+        _trim_host_allocator()
+        logger.info(
+            "Released %.2f GB host memory for hierarchical cache.",
+            self._requested_host_memory_bytes() / 1e9,
+        )
+
+    @synchronized
+    def resume_memory_occupation(self) -> None:
+        if not hasattr(self, "_host_memory_released"):
+            return
+        if not self._host_memory_released:
+            return
+        self._check_host_memory_available()
+        self._init_host_buffers()
+        self._post_init_host_buffers()
+        self._host_memory_released = False
         self.clear()
 
     def destroy(self):

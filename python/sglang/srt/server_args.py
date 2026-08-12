@@ -195,9 +195,15 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton", "ascend"]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
+    "flashinfer",
+    "fa3",
+    "triton",
+    "dsa",
+    "ascend",
+]
 
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton", "ascend"]
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton", "dsa", "ascend"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
@@ -2052,6 +2058,10 @@ class ServerArgs:
         Optional[str],
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
     ] = None
+    release_hicache: A[
+        bool,
+        "Release hierarchical cache host memory during release_memory_occupation.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
@@ -2372,6 +2382,10 @@ class ServerArgs:
             nargs="*",
         ),
     ] = None
+    custom_pull_weights_pre_read_hook: A[
+        Optional[str],
+        "Import path of a hook(source_dir, target_version) that /pull_weights calls before reading published weights.",
+    ] = None
     weight_loader_disable_mmap: A[
         bool,
         "Disable mmap while loading weight using safetensors.",
@@ -2508,6 +2522,10 @@ class ServerArgs:
     enable_deterministic_inference: A[
         bool,
         "Enable deterministic inference mode with batch invariant ops.",
+    ] = False
+    enable_fp32_moe_router: A[
+        bool,
+        "Compute DeepSeek-style MoE router logits in FP32.",
     ] = False
     rl_on_policy_target: A[
         Optional[str],
@@ -5852,7 +5870,7 @@ class ServerArgs:
 
             attention_backend = resolved_view(self).attention_backend
             if is_deepseek_model:
-                if attention_backend not in ["fa3", "triton"]:
+                if attention_backend not in ["fa3", "triton", "dsa"]:
                     raise ValueError(
                         f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
                     )

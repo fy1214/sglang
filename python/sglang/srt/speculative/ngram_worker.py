@@ -463,6 +463,7 @@ class NGRAMWorker(BaseSpecWorker):
                     logits_output,
                     predict,
                     accept_index,
+                    accept_lens,
                     self.draft_token_num - 1,
                 )
 

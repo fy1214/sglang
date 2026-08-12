@@ -59,6 +59,17 @@ else:
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+_DEEPGEMM_PAD_EXPERT_M = get_bool_env_var("SGLANG_DEEPGEMM_PAD_EXPERT_M")
+
+
+def _should_pad_contiguous_expert_m() -> bool:
+    return _DEEPGEMM_PAD_EXPERT_M or envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+
+
+def _pad_count_to_deepgemm_m_tile(count: int) -> int:
+    if count <= 0:
+        return 0
+    return ceil_div(count, 128) * 128
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -722,8 +733,17 @@ def pre_permute_deepep_normal_to_deep_gemm(
     ) = dispatch_output
     assert runner_config.activation == "silu"
 
-    all_tokens = sum(num_recv_tokens_per_expert)
+    actual_all_tokens = sum(num_recv_tokens_per_expert)
+    if _should_pad_contiguous_expert_m():
+        deepgemm_num_recv_tokens_per_expert = [
+            _pad_count_to_deepgemm_m_tile(int(count))
+            for count in num_recv_tokens_per_expert
+        ]
+    else:
+        deepgemm_num_recv_tokens_per_expert = num_recv_tokens_per_expert
+    all_tokens = sum(deepgemm_num_recv_tokens_per_expert)
     running_state["all_tokens"] = all_tokens
+    running_state["actual_all_tokens"] = actual_all_tokens
 
     K = hidden_states.shape[1]
 
@@ -737,10 +757,18 @@ def pre_permute_deepep_normal_to_deep_gemm(
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 
-    input_tensor = torch.empty(
-        (all_tokens, K),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
+    input_tensor = (
+        torch.zeros(
+            (all_tokens, K),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        if all_tokens != actual_all_tokens
+        else torch.empty(
+            (all_tokens, K),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
     )
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         # TODO check whether need `zeros`
@@ -750,21 +778,29 @@ def pre_permute_deepep_normal_to_deep_gemm(
             dtype=torch.int,
         ).transpose(0, 1)
     else:
-        input_tensor_scale = torch.empty(
-            (all_tokens, K // 128),
-            device=hidden_states.device,
-            dtype=torch.float32,
+        input_tensor_scale = (
+            torch.zeros(
+                (all_tokens, K // 128),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+            if all_tokens != actual_all_tokens
+            else torch.empty(
+                (all_tokens, K // 128),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
         )
     m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
 
     if get_offloader().forbid_copy_engine_usage:
         num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
-            num_recv_tokens_per_expert
+            deepgemm_num_recv_tokens_per_expert
         )
     else:
         num_recv_tokens_per_expert_gpu = torch.tensor(
-            num_recv_tokens_per_expert,
+            deepgemm_num_recv_tokens_per_expert,
             dtype=torch.int32,
             pin_memory=True,
             device="cpu",

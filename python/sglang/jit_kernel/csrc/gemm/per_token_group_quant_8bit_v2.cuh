@@ -45,7 +45,9 @@ SGL_DEVICE float silu(const float& val) {
   float t = __tanhf(half);
   return half * (1.0f + t);
 #else
-  return val / (1.0f + __expf(-val));
+  // Match sgl_kernel.silu_and_mul on SM90.  That kernel uses expf and
+  // exposes only the final SiLU*up BF16 rounding boundary.
+  return val / (1.0f + expf(-val));
 #endif
 }
 
@@ -297,7 +299,11 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
         for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
           float val;
           if constexpr (FUSE_SILU_AND_MUL) {
-            T val_lowprec = static_cast<T>(silu(static_cast<float>(input_primary_vec[j]))) * input_secondary_vec[j];
+            // Keep the same single visible low-precision boundary as the
+            // contiguous activation path.  Rounding SiLU before multiplying
+            // changes the second MoE GEMM's FP8 inputs.
+            T val_lowprec = static_cast<T>(
+                silu(static_cast<float>(input_primary_vec[j])) * static_cast<float>(input_secondary_vec[j]));
             val = static_cast<float>(val_lowprec);
             input_primary_vec[j] = val_lowprec;
           } else {
@@ -309,12 +315,16 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
         local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax);
 
         float y_scale, y_scale_inv;
-        // When SCALE_UE8M0, always quantize with the rounded (power-of-2) scale
-        // — not with the exact scale followed by post-hoc rounding.
-        // This matches the official DeepSeek-V4 kernel.py act_quant(scale_fmt="ue8m0")
-        // and avoids a scale mismatch between quantization and downstream GEMM dequant,
-        // which otherwise amplifies error ~14x and degrades EAGLE accept rate on Blackwell.
-        calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
+        if constexpr (SCALE_UE8M0) {
+          // Quantize with the rounded (power-of-2) scale on Blackwell.
+          calculate_fp8_scales<true, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
+        } else {
+          // Preserve the scale and division sequence of the legacy unmasked
+          // quantizer.  Reciprocal reuse under --use_fast_math moves a few
+          // values across an FP8 rounding boundary.
+          y_scale_inv = __fdiv_rn(local_absmax, dst_dtype_info::MAX);
+          y_scale = 1.0f / y_scale_inv;
+        }
         if (lane_id == 0) {
           *scale_output = extract_required_scale_format < SCALE_UE8M0 && IS_COLUMN_MAJOR > (y_scale_inv);
         }
@@ -322,14 +332,26 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
 
         int4 output_buf;
         if constexpr (std::is_same_v<DST_DTYPE, fp8_e4m3_t>) {
-          const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+          if constexpr (SCALE_UE8M0) {
+            const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
 #pragma unroll
-          for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
-            float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
-            float2 outputx2 = fmul2_rn(inputx2, y_scale_repeated);
-            outputx2.x = fminf(fmaxf(outputx2.x, dst_dtype_info::MIN), dst_dtype_info::MAX);
-            outputx2.y = fminf(fmaxf(outputx2.y, dst_dtype_info::MIN), dst_dtype_info::MAX);
-            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+            for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
+              float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
+              float2 outputx2 = fmul2_rn(inputx2, y_scale_repeated);
+              outputx2.x = fminf(fmaxf(outputx2.x, dst_dtype_info::MIN), dst_dtype_info::MAX);
+              outputx2.y = fminf(fmaxf(outputx2.y, dst_dtype_info::MIN), dst_dtype_info::MAX);
+              output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+            }
+          } else {
+            // Match the legacy SM90 quantizer's scalar conversion exactly;
+            // packed conversion makes a different tie choice for rare values.
+            const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
+#pragma unroll
+            for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
+              float val = static_cast<float>(input_primary_vec[j]);
+              float q_val = fminf(fmaxf(__fdiv_rn(val, y_scale_inv), dst_dtype_info::MIN), dst_dtype_info::MAX);
+              output_buf_ptr[j] = fp8_e4m3_t(q_val);
+            }
           }
         } else {
           const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
@@ -461,16 +483,53 @@ struct PerTokenGroupQuant8bitV2Kernel {
           else
             launch_with_config(TypeTag<NaiveScheduler>{}, std::true_type{}, std::true_type{}, std::true_type{});
         } else {
-          launch_with_config(TypeTag<NaiveScheduler>{}, std::true_type{}, std::true_type{}, std::false_type{});
+          if (masked_layout)
+            launch_with_config(TypeTag<MaskedLayoutScheduler>{}, std::true_type{}, std::true_type{}, std::false_type{});
+          else
+            launch_with_config(TypeTag<NaiveScheduler>{}, std::true_type{}, std::true_type{}, std::false_type{});
         }
       } else {
-        launch_with_config(TypeTag<NaiveScheduler>{}, std::true_type{}, std::false_type{}, std::false_type{});
+        if (fuse_silu_and_mul) {
+          if (masked_layout)
+            launch_with_config(TypeTag<MaskedLayoutScheduler>{}, std::true_type{}, std::false_type{}, std::true_type{});
+          else
+            launch_with_config(TypeTag<NaiveScheduler>{}, std::true_type{}, std::false_type{}, std::true_type{});
+        } else {
+          if (masked_layout)
+            launch_with_config(
+                TypeTag<MaskedLayoutScheduler>{}, std::true_type{}, std::false_type{}, std::false_type{});
+          else
+            launch_with_config(TypeTag<NaiveScheduler>{}, std::true_type{}, std::false_type{}, std::false_type{});
+        }
       }
     } else {
       if (scale_ue8m0) {
-        launch_with_config(TypeTag<NaiveScheduler>{}, std::false_type{}, std::true_type{}, std::false_type{});
+        if (fuse_silu_and_mul) {
+          if (masked_layout)
+            launch_with_config(TypeTag<MaskedLayoutScheduler>{}, std::false_type{}, std::true_type{}, std::true_type{});
+          else
+            launch_with_config(TypeTag<NaiveScheduler>{}, std::false_type{}, std::true_type{}, std::true_type{});
+        } else {
+          if (masked_layout)
+            launch_with_config(
+                TypeTag<MaskedLayoutScheduler>{}, std::false_type{}, std::true_type{}, std::false_type{});
+          else
+            launch_with_config(TypeTag<NaiveScheduler>{}, std::false_type{}, std::true_type{}, std::false_type{});
+        }
       } else {
-        launch_with_config(TypeTag<NaiveScheduler>{}, std::false_type{}, std::false_type{}, std::false_type{});
+        if (fuse_silu_and_mul) {
+          if (masked_layout)
+            launch_with_config(
+                TypeTag<MaskedLayoutScheduler>{}, std::false_type{}, std::false_type{}, std::true_type{});
+          else
+            launch_with_config(TypeTag<NaiveScheduler>{}, std::false_type{}, std::false_type{}, std::true_type{});
+        } else {
+          if (masked_layout)
+            launch_with_config(
+                TypeTag<MaskedLayoutScheduler>{}, std::false_type{}, std::false_type{}, std::false_type{});
+          else
+            launch_with_config(TypeTag<NaiveScheduler>{}, std::false_type{}, std::false_type{}, std::false_type{});
+        }
       }
     }
   }

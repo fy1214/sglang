@@ -121,6 +121,11 @@ class GenerationBatchResult:
                     _async_d2h(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
+            if self.logits_output.next_token_top_p_token_ids is not None:
+                self.logits_output.next_token_top_p_token_ids = [
+                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                    for v in self.logits_output.next_token_top_p_token_ids
+                ]
         if return_hidden_states and self.logits_output.hidden_states is not None:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
@@ -207,6 +212,7 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "next_token_top_logprobs_idx": result.logits_output.next_token_top_logprobs_idx,
         "next_token_token_ids_logprobs_val": result.logits_output.next_token_token_ids_logprobs_val,
         "next_token_token_ids_logprobs_idx": result.logits_output.next_token_token_ids_logprobs_idx,
+        "next_token_top_p_token_ids": result.logits_output.next_token_top_p_token_ids,
         "input_token_logprobs": result.logits_output.input_token_logprobs,
         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
         "input_top_logprobs_idx": result.logits_output.input_top_logprobs_idx,
@@ -231,6 +237,9 @@ def get_logprob_from_pp_outputs(
         next_token_token_ids_logprobs_idx=next_pp_outputs[
             "next_token_token_ids_logprobs_idx"
         ],
+        next_token_top_p_token_ids=next_pp_outputs.tensors.get(
+            "next_token_top_p_token_ids", None
+        ),
         input_token_logprobs=next_pp_outputs["input_token_logprobs"],
         input_top_logprobs_val=next_pp_outputs["input_top_logprobs_val"],
         input_top_logprobs_idx=next_pp_outputs["input_top_logprobs_idx"],

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -335,6 +337,11 @@ class PrefillBootstrapQueue:
             self.scheduler.attn_tp_cpu_group,
         )
 
+        bootstrap_timeout = float(
+            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
+        )
+        now = time.perf_counter()
+
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if (
                 rids_to_check is not None
@@ -351,6 +358,27 @@ class PrefillBootstrapQueue:
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
+                entry_time = req.time_stats.prefill_bootstrap_queue_entry_time
+                if entry_time > 0 and now - entry_time > bootstrap_timeout:
+                    error_message = (
+                        f"Prefill bootstrap timed out after {now - entry_time:.1f}s "
+                        f"for request rank={self.tp_rank} "
+                        f"{req.rid=} {req.bootstrap_room=}"
+                    )
+                    logger.error(error_message)
+                    prepare_abort(
+                        req,
+                        error_message,
+                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                    )
+                    self.scheduler.output_streamer.stream_output(
+                        [req], req.return_logprob
+                    )
+                    indices_to_remove.add(i)
+                    failed_reqs.append(req)
+                    if self.scheduler.metrics_reporter.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                    continue
                 if (
                     req.time_stats.prefill_retry_count
                     < self.scheduler.server_args.optimistic_prefill_retries
@@ -741,6 +769,11 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
+        transfer_timeout = float(
+            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
+        )
+        now = time.perf_counter()
+
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
@@ -765,7 +798,27 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
-                undone_reqs.append(req)
+                entry_time = req.time_stats.prefill_transfer_queue_entry_time
+                if entry_time > 0 and now - entry_time > transfer_timeout:
+                    error_message = (
+                        f"Prefill transfer timed out after {now - entry_time:.1f}s "
+                        f"(state={poll}) for request rank={self.ps.tp_rank} "
+                        f"{req.rid=} {req.bootstrap_room=}"
+                    )
+                    logger.error(error_message)
+                    release_kv_cache(req, self.tree_cache)
+                    prepare_abort(
+                        req,
+                        error_message,
+                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                    )
+                    if hasattr(req.disagg_kv_sender, "clear"):
+                        req.disagg_kv_sender.clear()
+                    done_reqs.append(req)
+                    if self.metrics_reporter.enable_metrics:
+                        self.metrics_collector.increment_transfer_failed_reqs()
+                else:
+                    undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)

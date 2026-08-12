@@ -33,7 +33,18 @@ class TensorDumper:
         pp_rank: int,
     ):
         self._dump_layers = dump_layers
+        self._layer_outputs_only = (
+            os.getenv("SGLANG_TENSOR_DUMP_LAYER_OUTPUTS_ONLY", "0") == "1"
+        )
+        self._module_suffixes = tuple(
+            suffix.strip()
+            for suffix in os.getenv("SGLANG_TENSOR_DUMP_MODULE_SUFFIXES", "").split(",")
+            if suffix.strip()
+        )
         self._forward_pass_id = 0
+        self._chunk_size = max(1, int(os.getenv("SGLANG_TENSOR_DUMP_CHUNK_SIZE", "1")))
+        self._chunk_id = 0
+        self._chunk_records = []
         self._pid = os.getpid()
         self._current_tensors = {}
         self._base_dir = Path(dump_dir)
@@ -58,14 +69,21 @@ class TensorDumper:
         elif isinstance(tensor_item, LogitsProcessorOutput):
             self._current_tensors[name] = tensor_item.next_token_logits.cpu()
         elif isinstance(tensor_item, ForwardBatch):
-            self._current_tensors[name + ".forward_batch_info.input_ids"] = (
-                tensor_item.input_ids.cpu()
-            )
-            self._current_tensors[name + ".forward_batch_info.seq_lens"] = (
-                tensor_item.seq_lens.cpu()
-            )
-            self._current_tensors[name + ".forward_batch_info.positions"] = (
-                tensor_item.positions.cpu()
+            prefix = name + ".forward_batch_info."
+            for field_name in (
+                "input_ids",
+                "seq_lens",
+                "positions",
+                "req_pool_indices",
+                "extend_seq_lens",
+                "extend_prefix_lens",
+            ):
+                value = getattr(tensor_item, field_name, None)
+                if isinstance(value, torch.Tensor):
+                    self._current_tensors[prefix + field_name] = value.cpu()
+            self._current_tensors[prefix + "rids"] = tensor_item.rids
+            self._current_tensors[prefix + "forward_mode"] = str(
+                tensor_item.forward_mode
             )
         elif isinstance(tensor_item, PPProxyTensors):
             for tensor_name in tensor_item.tensors.keys():
@@ -78,11 +96,21 @@ class TensorDumper:
     def dump_current_tensors(self):
         if len(self._current_tensors) == 0:
             return
-        tensor_file_for_pass = self._process_dir / f"Pass{self._forward_pass_id:05d}.pt"
+        if self._layer_outputs_only and self._chunk_size > 1:
+            self._chunk_records.append(self._current_tensors)
+            tensor_file_for_pass = self._process_dir / f"Chunk{self._chunk_id:05d}.pt"
+            torch.save(self._chunk_records, str(tensor_file_for_pass))
+            if len(self._chunk_records) == self._chunk_size:
+                self._chunk_records = []
+                self._chunk_id += 1
+        else:
+            tensor_file_for_pass = (
+                self._process_dir / f"Pass{self._forward_pass_id:05d}.pt"
+            )
+            torch.save(self._current_tensors, str(tensor_file_for_pass))
         logger.info(
             f"Dump {self._forward_pass_id:05d}th pass to {tensor_file_for_pass}"
         )
-        torch.save(self._current_tensors, str(tensor_file_for_pass))
         self._current_tensors = {}
         self._forward_pass_id += 1
 
@@ -100,21 +128,29 @@ class TensorDumper:
                     top_level_model = True
             else:
                 cur_name = prefix + "." + name
-            if (
-                self._dump_layers is not None
-                and name.isdigit()
-                and prefix == layers_prefix
-            ):
+            is_layer_module = name.isdigit() and prefix == layers_prefix
+            if self._dump_layers is not None and is_layer_module:
                 # If we only need n layers, skip the reset layers.
                 # Most models' layout is like model.layers.0.
                 cur_layer = int(name)
                 if cur_layer not in self._dump_layers:
                     continue
             if module is not None:
+                if is_layer_module and self._layer_outputs_only:
+                    module.register_forward_hook(self._dump_hook(cur_name, False))
+                    if not self._module_suffixes:
+                        continue
                 _, sub_count = self._add_hook_recursive(
                     module, cur_name, top_level_module_name, layers_module_name
                 )
-                if sub_count == 0 or top_level_model:
+                selected_module = any(
+                    cur_name.endswith(suffix) for suffix in self._module_suffixes
+                )
+                if (
+                    top_level_model
+                    or selected_module
+                    or (sub_count == 0 and not self._layer_outputs_only)
+                ):
                     # Avoid duplicated output hooks, e.g. self_attn may contain:
                     # self_attn.qkv_proj, self_attn.attn & self_attn.o_proj.
                     # Therefore, we do not need to add output hooks for self_attn,
@@ -126,14 +162,14 @@ class TensorDumper:
 
     def _dump_hook(self, tensor_name, do_dump):
         def inner_dump_hook(module, input, output):
+            if output is not None and not (do_dump and self._layer_outputs_only):
+                self.add_tensor(tensor_name, output)
             if do_dump:
                 # This is the top-level model, so we will record the input for it.
                 for item in input:
                     if isinstance(item, ForwardBatch):
                         self.add_tensor(tensor_name, item)
                 self.dump_current_tensors()
-            if output is not None:
-                self.add_tensor(tensor_name, output)
 
         return inner_dump_hook
 

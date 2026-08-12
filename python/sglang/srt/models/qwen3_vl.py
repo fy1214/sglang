@@ -1169,9 +1169,14 @@ class Qwen3LLMModel(Qwen3Model):
             # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
             # The order matters because addition with different tensors is not associative in practice.
             # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
-            deepstack_embeds = self.get_deepstack_embeds(
-                layer_idx - 1, input_deepstack_embeds
-            )
+            deepstack_embeds = None
+            if input_deepstack_embeds is not None:
+                prev_layer_idx = layer_idx - 1
+                if prev_layer_idx in self.deepstack_embed_to_decoder_layer:
+                    sep = self.hidden_size * prev_layer_idx
+                    deepstack_embeds = input_deepstack_embeds[
+                        :, sep : sep + self.hidden_size
+                    ]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,

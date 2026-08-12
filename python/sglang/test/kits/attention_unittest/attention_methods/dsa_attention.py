@@ -1228,16 +1228,14 @@ DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
     "aiter",
 )
 
-# Impls that accept an FP8-stored K cache. The flashmla *sparse* and FA3
-# kernels require BF16 K (`kv must have dtype torch::kBFloat16`), so they
-# fall back to the inline-quantize-of-bf16 path that production *doesn't*
-# take in FP8 deployments. The `flashmla_kv` decode kernel and *both*
-# flashmla prefill kernels are the production-relevant FP8 paths.
+# Impls that support an FP8-stored K cache. FlashMLA sparse requires BF16 K,
+# so the backend gathers and dequantizes only the selected pages before calling
+# it. The `flashmla_kv` kernels consume the packed cache directly.
 DSA_FP8_COMPATIBLE_PREFILL_IMPLS: frozenset[str] = frozenset(
     {"flashmla_sparse", "flashmla_kv", "flashmla_auto"}
 )
 DSA_FP8_COMPATIBLE_DECODE_IMPLS: frozenset[str] = frozenset(
-    {"flashmla_kv", "flashmla_auto"}
+    {"flashmla_sparse", "flashmla_kv", "flashmla_auto"}
 )
 
 
@@ -1400,15 +1398,11 @@ def run_dsa_sparse_fp8_decode_case(
     *,
     dsa_decode_backend: str = "flashmla_kv",
 ) -> None:
-    """FP8-KV-cache decode. Only `flashmla_kv` (and `flashmla_auto`
-    which resolves to it for FP8) accepts an FP8-stored K cache;
-    `flashmla_sparse` and `fa3` decode kernels assert BF16 K and would
-    fall back to the inline-quantize-of-bf16 path that production
-    doesn't take in FP8 deployments."""
+    """FP8-KV-cache decode. `flashmla_kv` reads the packed cache directly;
+    `flashmla_sparse` gathers and dequantizes the selected pages to BF16."""
     if dsa_decode_backend not in DSA_FP8_COMPATIBLE_DECODE_IMPLS:
         testcase.skipTest(
-            f"DSA decode impl `{dsa_decode_backend}` does not support FP8 KV "
-            f"cache (only `flashmla_kv` / `flashmla_auto` read FP8 K directly)."
+            f"DSA decode impl `{dsa_decode_backend}` does not support FP8 KV " "cache."
         )
     if not case.forward_mode.is_decode():
         raise ValueError("run_dsa_sparse_fp8_decode_case expects a DECODE case.")

@@ -558,7 +558,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
-        set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
+        if not is_draft_worker:
+            set_offloader(
+                create_offloader_from_server_args(server_args, dp_rank=dp_rank)
+            )
 
         self._weight_checker = WeightChecker(model_runner=self)
 
@@ -1842,7 +1845,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         weight_name_filter: Optional[Callable[[str], bool]] = None,
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
-        """Update engine weights in-place from the disk."""
+        """Update engine weights in-place from disk."""
         logger.info(
             f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
@@ -2215,6 +2218,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Load the reconstructed tensors using the standard method
         self.model.load_weights(reconstructed_tensors)
+
+        # The flattened tensor can be backed by CUDA IPC memory owned by the
+        # training process.  Weight loaders enqueue device-to-device copies,
+        # while the RPC response releases the producer-side IPC buffer.  Make
+        # the copies complete before returning so a following bucket cannot
+        # reuse that storage and corrupt the just-loaded weights.
+        if self.device == "cuda":
+            torch.cuda.synchronize()
 
         return True, "Success"
 
@@ -3058,6 +3069,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
+        cuda_graph_num_tokens = None
+        decode_graph_runner = getattr(self, "decode_cuda_graph_runner", None)
+        if getattr(decode_graph_runner, "bs", None):
+            cuda_graph_num_tokens = decode_graph_runner.bs * getattr(
+                decode_graph_runner, "num_tokens_per_bs", 1
+            )
         if (
             not self.is_draft_worker
             and (experts_capturer := get_global_experts_capturer()) is not None
@@ -3065,7 +3082,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=cuda_graph_num_tokens,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -3073,7 +3090,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             output.indexer_topk_output = indexer_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=cuda_graph_num_tokens,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -3359,6 +3376,39 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
 
+    def post_process_weights(
+        self,
+        restore_weights_before_load: bool = False,
+        post_process_quantization: bool = False,
+    ):
+        """Run optional post-loading hooks, such as quantization repacking."""
+        from sglang.srt.model_loader.loader import device_loading_context
+
+        if self.device == "cuda":
+            target_device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            target_device = torch.device(self.device)
+
+        if restore_weights_before_load:
+            for _, module in self.model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None and hasattr(
+                    quant_method, "restore_weights_before_loading"
+                ):
+                    with device_loading_context(module, target_device):
+                        quant_method.restore_weights_before_loading(module)
+
+        if post_process_quantization:
+            for _, module in self.model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None and hasattr(
+                    quant_method, "process_weights_after_loading"
+                ):
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+
+        return True, "Success"
+
     def prealloc_symmetric_memory_pool(self):
         # PyTorch mempools never de-fragment memory in OOM scenarios, so we need to pre-allocate a large chunk of memory to limit fragmentation.
         if (
@@ -3406,6 +3456,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 split_forward_count,
             )
         return output
+
+
+def _resolve_torch_dtype(dtype: Union[str, torch.dtype]) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    dtype_name = dtype.split(".", 1)[1] if dtype.startswith("torch.") else dtype
+    return getattr(torch, dtype_name)
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

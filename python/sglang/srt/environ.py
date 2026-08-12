@@ -601,6 +601,7 @@ class Envs:
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
+    SGLANG_DEEPGEMM_BATCH_INVARIANT = EnvBool(False)
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
@@ -611,6 +612,7 @@ class Envs:
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)  # This argument is deprecated
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    SGLANG_DEEPEP_LL_PREFILL_STAGING = EnvBool(False)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the

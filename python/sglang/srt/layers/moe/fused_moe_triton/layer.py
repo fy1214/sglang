@@ -21,7 +21,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dp_attention import (
+    get_is_extend_in_batch,
+    is_allocation_symmetric,
+)
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_deepep_mode,
@@ -82,6 +85,31 @@ _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+def compute_deepep_ll_prefill_staging_slices(
+    *,
+    local_num_tokens: int,
+    max_num_tokens: int,
+    capacity: int,
+) -> List[slice]:
+    """Return rank-synchronous token windows for low-latency prefill."""
+
+    if capacity <= 0:
+        raise ValueError(f"DeepEP staging capacity must be positive, got {capacity}")
+    if local_num_tokens < 0 or max_num_tokens < local_num_tokens:
+        raise ValueError(
+            "Invalid DeepEP staging token counts: "
+            f"local={local_num_tokens}, max={max_num_tokens}"
+        )
+    num_stages = (max_num_tokens + capacity - 1) // capacity
+    return [
+        slice(
+            min(stage * capacity, local_num_tokens),
+            min((stage + 1) * capacity, local_num_tokens),
+        )
+        for stage in range(num_stages)
+    ]
 
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
@@ -1228,7 +1256,76 @@ class FusedMoE(torch.nn.Module):
         else:
             return self.forward_impl(hidden_states, topk_output)
 
+    def _get_deepep_ll_prefill_staging_slices(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> Optional[List[slice]]:
+        if not envs.SGLANG_DEEPEP_LL_PREFILL_STAGING.get():
+            return None
+        if not get_moe_a2a_backend().is_deepep() or not get_is_extend_in_batch():
+            return None
+        if not get_deepep_mode().resolve(True).is_low_latency():
+            return None
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            raise TypeError(
+                "DeepEP LL prefill staging requires standard top-k output, "
+                f"got {topk_output.format}"
+            )
+
+        local_num_tokens = hidden_states.shape[0]
+        max_num_tokens_tensor = torch.tensor(
+            local_num_tokens,
+            dtype=torch.int64,
+            device=hidden_states.device,
+        )
+        torch.distributed.all_reduce(
+            max_num_tokens_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=get_tp_group().device_group,
+        )
+        max_num_tokens = int(max_num_tokens_tensor.item())
+
+        capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        if max_num_tokens <= capacity:
+            return None
+        return compute_deepep_ll_prefill_staging_slices(
+            local_num_tokens=local_num_tokens,
+            max_num_tokens=max_num_tokens,
+            capacity=capacity,
+        )
+
+    @staticmethod
+    def _slice_standard_topk_output(
+        topk_output: StandardTopKOutput, token_slice: slice
+    ) -> StandardTopKOutput:
+        router_logits = topk_output.router_logits
+        return StandardTopKOutput(
+            topk_weights=topk_output.topk_weights[token_slice],
+            topk_ids=topk_output.topk_ids[token_slice],
+            router_logits=(
+                router_logits[token_slice] if router_logits is not None else None
+            ),
+        )
+
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        staging_slices = self._get_deepep_ll_prefill_staging_slices(
+            hidden_states, topk_output
+        )
+        if staging_slices is None:
+            return self._forward_impl_once(hidden_states, topk_output)
+
+        final_hidden_states = hidden_states.new_empty(hidden_states.shape)
+        for token_slice in staging_slices:
+            staged_hidden_states = self._forward_impl_once(
+                hidden_states[token_slice],
+                self._slice_standard_topk_output(topk_output, token_slice),
+            )
+            if token_slice.stop > token_slice.start:
+                final_hidden_states[token_slice].copy_(staged_hidden_states)
+        return final_hidden_states
+
+    def _forward_impl_once(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 

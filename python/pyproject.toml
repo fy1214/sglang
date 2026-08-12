@@ -23,7 +23,7 @@ dependencies = [
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
-  "cuda-python>=13.0",
+  "cuda-python>=12,<13",
   "datasets",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "distro",
@@ -32,7 +32,7 @@ dependencies = [
   "fastapi",
   "flash-attn-4==4.0.0b15",
   "flashinfer_cubin==0.6.12",
-  "flashinfer_python[cu13]==0.6.12", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_python[cu12]==0.6.12", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
   "interegular",
   "IPython",
@@ -43,7 +43,7 @@ dependencies = [
   "msgspec",
   "ninja",
   "numpy",
-  "nvidia-cutlass-dsl[cu13]==4.5.2",
+  "nvidia-cutlass-dsl==4.5.2",
   "nvidia-mathdx==25.6.0",
   "nvidia-ml-py",
   "openai==2.6.1",

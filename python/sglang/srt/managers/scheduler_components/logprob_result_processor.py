@@ -314,6 +314,13 @@ class SchedulerLogprobResultProcessor:
                 output.next_token_token_ids_logprobs_idx[i]
             )
 
+        if output.next_token_top_p_token_ids:
+            row_top_p_token_ids = output.next_token_top_p_token_ids[i]
+            if row_top_p_token_ids is not None:
+                if torch.is_tensor(row_top_p_token_ids):
+                    row_top_p_token_ids = row_top_p_token_ids.tolist()
+                req.logprob.output_top_p_token_ids.append(row_top_p_token_ids)
+
         return num_input_logprobs
 
     def _initialize_empty_logprob_containers(self, req: Req) -> None:

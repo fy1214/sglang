@@ -10,6 +10,7 @@ from .batch_invariant_ops import (
     matmul_persistent,
     mean_dim,
     rms_norm_batch_invariant,
+    router_gemm_batch_invariant,
     set_batch_invariant_mode,
 )
 
@@ -26,4 +27,5 @@ __all__ = [
     "get_batch_invariant_attention_block_size",
     "AttentionBlockSize",
     "rms_norm_batch_invariant",
+    "router_gemm_batch_invariant",
 ]

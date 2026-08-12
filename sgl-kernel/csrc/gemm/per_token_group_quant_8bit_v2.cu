@@ -35,7 +35,9 @@ __device__ __forceinline__ float silu(const float& val) {
   float t = __tanhf(half);
   return half * (1.0f + t);
 #else
-  return val / (1.0f + __expf(-val));
+  // Match sgl_kernel.silu_and_mul on SM90.  That kernel uses expf and
+  // exposes only the final SiLU*up BF16 rounding boundary.
+  return val / (1.0f + expf(-val));
 #endif
 }
 
@@ -266,7 +268,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     // TODO can this be removed?
     const int scale_expert_stride,
     const int scale_hidden_stride,
-    const int num_tokens_per_expert) {
+    const int num_tokens_per_expert,
+    const float max_8bit) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
@@ -347,8 +350,11 @@ __global__ void per_token_group_quant_8bit_kernel(
         for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
           float val;
           if constexpr (FUSE_SILU_AND_MUL) {
-            // TODO maybe vectorize
-            T val_lowprec = static_cast<T>(silu(static_cast<float>(input_primary_vec[j]))) * input_secondary_vec[j];
+            // Keep the same single visible low-precision boundary as the
+            // contiguous activation path.  Rounding SiLU before multiplying
+            // changes the second MoE GEMM's FP8 inputs.
+            T val_lowprec = static_cast<T>(
+                silu(static_cast<float>(input_primary_vec[j])) * static_cast<float>(input_secondary_vec[j]));
             val = static_cast<float>(val_lowprec);
             input_primary_vec[j] = val_lowprec;
           } else {
@@ -362,8 +368,15 @@ __global__ void per_token_group_quant_8bit_kernel(
         local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax, lane_id);
 
         float y_scale, y_scale_inv;
-        calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
-        float2 y_scale_repeated = {y_scale, y_scale};
+        if constexpr (SCALE_UE8M0) {
+          calculate_fp8_scales<true, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
+        } else {
+          // Preserve the scale and division sequence of the legacy unmasked
+          // quantizer.  Reciprocal reuse under -use_fast_math moves a few
+          // values across an FP8 rounding boundary.
+          y_scale_inv = __fdiv_rn(local_absmax, max_8bit);
+          y_scale = 1.0f / y_scale_inv;
+        }
 
         if (lane_id == 0) {
           *scale_output = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
@@ -373,19 +386,31 @@ __global__ void per_token_group_quant_8bit_kernel(
         static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE * sizeof(DST_DTYPE));
 
         if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
-          const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
-          static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
-          static_assert(INPUT_PRIMARY_VEC_SIZE % 2 == 0);
+          if constexpr (SCALE_UE8M0) {
+            const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+            static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
+            static_assert(INPUT_PRIMARY_VEC_SIZE % 2 == 0);
 
 #pragma unroll
-          for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
-            float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
-            float2 outputx2 = fmul2_rn(inputx2, y_scale_repeated);
+            for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
+              float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
+              float2 outputx2 = fmul2_rn(inputx2, {y_scale, y_scale});
 
-            outputx2.x = fminf(fmaxf(outputx2.x, dst_dtype_info::MIN), dst_dtype_info::MAX);
-            outputx2.y = fminf(fmaxf(outputx2.y, dst_dtype_info::MIN), dst_dtype_info::MAX);
+              outputx2.x = fminf(fmaxf(outputx2.x, dst_dtype_info::MIN), dst_dtype_info::MAX);
+              outputx2.y = fminf(fmaxf(outputx2.y, dst_dtype_info::MIN), dst_dtype_info::MAX);
 
-            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+              output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+            }
+          } else {
+            // Match the legacy SM90 quantizer's scalar conversion exactly;
+            // packed conversion makes a different tie choice for rare values.
+            const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
+#pragma unroll
+            for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
+              float val = static_cast<float>(input_primary_vec[j]);
+              float q_val = fminf(fmaxf(__fdiv_rn(val, y_scale_inv), dst_dtype_info::MIN), dst_dtype_info::MAX);
+              output_buf_ptr[j] = DST_DTYPE(q_val);
+            }
           }
         } else {
           const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
@@ -474,7 +499,8 @@ void sgl_per_token_group_quant_8bit_v2(
         hidden_dim_num_groups,                                                                                       \
         scale_expert_stride,                                                                                         \
         scale_hidden_stride,                                                                                         \
-        num_tokens_per_expert);                                                                                      \
+        num_tokens_per_expert,                                                                                       \
+        static_cast<float>(max_8bit));                                                                               \
   } while (0)
 
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                                     \
@@ -497,13 +523,51 @@ void sgl_per_token_group_quant_8bit_v2(
                 NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true, true);         \
           }                                                                                                         \
         } else {                                                                                                    \
-          LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true); \
+          if (masked_layout) {                                                                                      \
+            LAUNCH_KERNEL_INNER(                                                                                    \
+                MaskedLayoutScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true, false); \
+          } else {                                                                                                  \
+            LAUNCH_KERNEL_INNER(                                                                                    \
+                NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true, false);        \
+          }                                                                                                         \
         }                                                                                                           \
       } else {                                                                                                      \
-        LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true);            \
+        if (fuse_silu_and_mul) {                                                                                    \
+          if (masked_layout) {                                                                                      \
+            LAUNCH_KERNEL_INNER(                                                                                    \
+                MaskedLayoutScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true, false, true);    \
+          } else {                                                                                                  \
+            LAUNCH_KERNEL_INNER(                                                                                    \
+                NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true, false, true);           \
+          }                                                                                                         \
+        } else {                                                                                                    \
+          if (masked_layout) {                                                                                      \
+            LAUNCH_KERNEL_INNER(                                                                                    \
+                MaskedLayoutScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true, false, false);   \
+          } else {                                                                                                  \
+            LAUNCH_KERNEL_INNER(                                                                                    \
+                NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true, false, false);          \
+          }                                                                                                         \
+        }                                                                                                           \
       }                                                                                                             \
     } else {                                                                                                        \
-      LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);             \
+      if (fuse_silu_and_mul) {                                                                                      \
+        if (masked_layout) {                                                                                        \
+          LAUNCH_KERNEL_INNER(                                                                                      \
+              MaskedLayoutScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false, false, true);     \
+        } else {                                                                                                    \
+          LAUNCH_KERNEL_INNER(                                                                                      \
+              NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false, false, true);            \
+        }                                                                                                           \
+      } else {                                                                                                      \
+        if (masked_layout) {                                                                                        \
+          LAUNCH_KERNEL_INNER(                                                                                      \
+              MaskedLayoutScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false, false, false);    \
+        } else {                                                                                                    \
+          LAUNCH_KERNEL_INNER(                                                                                      \
+              NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false, false, false);           \
+        }                                                                                                           \
+      }                                                                                                             \
     }                                                                                                               \
   } while (0)
 

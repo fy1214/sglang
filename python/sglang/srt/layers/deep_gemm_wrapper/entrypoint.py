@@ -203,7 +203,29 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     if envs.SGLANG_DEEPGEMM_PDL.get() and hasattr(deep_gemm, "set_pdl"):
         deep_gemm.set_pdl(True)
 
+    configure_deep_gemm_batch_invariant(
+        server_args.enable_deterministic_inference
+        or envs.SGLANG_DEEPGEMM_BATCH_INVARIANT.get()
+    )
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
+
+
+def configure_deep_gemm_batch_invariant(enabled: bool):
+    if not ENABLE_JIT_DEEPGEMM:
+        return
+
+    setter = getattr(deep_gemm, "set_batch_invariant", None)
+    if setter is None:
+        if enabled:
+            logger.warning(
+                "The installed DeepGEMM does not expose set_batch_invariant; "
+                "install the GLM-5 alignment DeepGEMM build."
+            )
+        return
+
+    # Configure this before warmup/JIT so serving and training select the same
+    # invariant dense and grouped kernel variants.
+    setter(enabled)
 
 
 @contextmanager

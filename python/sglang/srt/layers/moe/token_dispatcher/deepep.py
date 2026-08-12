@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_output_dtype,
     is_tbo_enabled,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
@@ -644,6 +646,19 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
         self.quant_config = {}
+        self.align_fp8_quantization = self._supports_aligned_fp8_quantization(
+            Buffer.low_latency_dispatch
+        ) and bool(get_global_server_args().enable_deterministic_inference)
+
+    @staticmethod
+    def _supports_aligned_fp8_quantization(dispatch_method) -> bool:
+        try:
+            return (
+                "align_fp8_quantization"
+                in inspect.signature(dispatch_method).parameters
+            )
+        except (TypeError, ValueError):
+            return False
 
     def dispatch_a(
         self,
@@ -725,6 +740,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+        alignment_kwargs = (
+            {"align_fp8_quantization": True} if self.align_fp8_quantization else {}
+        )
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -741,6 +759,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **fp8_deepgemm_scale_opts,
+                **alignment_kwargs,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook

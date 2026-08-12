@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata
@@ -83,6 +84,110 @@ def get_top_logprobs(
         stage=LogprobStage.DECODE,
         no_copy_to_cpu=no_copy_to_cpu,
     )
+
+
+def _top_p_filter_rows(
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+    request_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Rows that were requested AND actually have a top-k/top-p/min-p filter."""
+    row_has_filter = top_ks != TOP_K_ALL
+    if need_top_p_sampling:
+        row_has_filter = row_has_filter | (top_ps != 1.0)
+    if need_min_p_sampling:
+        row_has_filter = row_has_filter | (min_ps > 0)
+    return request_mask & row_has_filter
+
+
+def _top_p_keep_mask_sorted(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Boolean nucleus keep-mask in descending-prob order, plus the sort indices.
+
+    Reproduces SGLang's sampler truncation (rank < top_k, cumulative prob within
+    top_p, prob >= top1 * min_p) so replay sees the exact set the sampler keeps.
+    """
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    ranks = torch.arange(probs_sort.shape[-1], device=probs_sort.device).view(1, -1)
+    keep = ranks < top_ks.view(-1, 1)
+    if need_top_p_sampling:
+        keep &= (torch.cumsum(probs_sort, dim=-1) - probs_sort) <= top_ps.view(-1, 1)
+    if need_min_p_sampling:
+        keep &= probs_sort >= (probs_sort[:, 0] * min_ps).view(-1, 1)
+    return keep, probs_idx
+
+
+def renorm_logprob_over_top_p(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+    request_mask: torch.Tensor,
+    force_keep_token_ids: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    rows = _top_p_filter_rows(
+        top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling, request_mask
+    )
+    if not bool(rows.any().item()):
+        return None
+
+    keep, probs_idx = _top_p_keep_mask_sorted(
+        probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
+    )
+    # Scatter the keep-mask back to vocab order so we renormalize directly over
+    # vocab ids (and can force-keep specific token ids).
+    keep_vocab = torch.empty_like(keep)
+    keep_vocab.scatter_(-1, probs_idx, keep)
+
+    if force_keep_token_ids is not None:
+        # Force-keep the sampled/accepted token so its renormalized logprob is
+        # finite even when SGLang's sampling kernel (e.g. flashinfer) keeps a
+        # boundary token that this torch nucleus drops. This matches the trainer,
+        # which also force-keeps the target token before renormalizing, so the
+        # rollout and training denominators are both ``nucleus ∪ {token}``.
+        # Non-filter rows are overwritten by the ``torch.where`` below, so
+        # force-keeping every row is harmless and avoids a row gather.
+        row_idx = torch.arange(keep_vocab.shape[0], device=keep_vocab.device)
+        keep_vocab[row_idx, force_keep_token_ids] = True
+
+    kept_probs = probs * keep_vocab
+    kept_probs = kept_probs / kept_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return torch.where(rows.view(-1, 1), torch.log(kept_probs), torch.log(probs))
+
+
+def get_top_p_token_ids_from_probs(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+    request_mask: torch.Tensor,
+) -> Optional[List[Optional[torch.Tensor]]]:
+    rows = _top_p_filter_rows(
+        top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling, request_mask
+    )
+    if not bool(rows.any().item()):
+        return None
+
+    keep, probs_idx = _top_p_keep_mask_sorted(
+        probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
+    )
+    return [
+        probs_idx[i][keep[i]].to(torch.int32) if bool(rows[i].item()) else None
+        for i in range(probs.shape[0])
+    ]
 
 
 def get_token_ids_logprobs_raw(
@@ -297,13 +402,14 @@ def compute_spec_v2_logprobs(
     logits_output,
     predict: torch.Tensor,
     accept_index: torch.Tensor,
+    accept_lens: torch.Tensor,
     speculative_num_steps: int,
 ):
     """Compute logprobs for accepted tokens after spec v2 verify sampling.
 
     Gathers logits at accepted positions, applies log_softmax (temperature-scaled
-    if not greedy), and populates logits_output.next_token_logprobs (plus optional
-    top-k / token-ids logprobs) so they flow through copy_to_cpu().
+    if not greedy), and populates logits_output.next_token_logprobs plus optional
+    top-k / token-ids / top-p replay metadata so they flow through copy_to_cpu().
     """
     bs = len(batch.seq_lens)
     max_accept = speculative_num_steps + 1
@@ -311,6 +417,7 @@ def compute_spec_v2_logprobs(
 
     flat_accept_idx = accept_index.long().reshape(-1)
     gathered_logits = logits_output.next_token_logits[flat_accept_idx]
+    temperatures = None
 
     if batch.sampling_info.is_all_greedy or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
         gathered_logprobs = torch.nn.functional.log_softmax(gathered_logits, dim=-1)
@@ -331,6 +438,82 @@ def compute_spec_v2_logprobs(
         accepted_token_ids.long(),
     ]
     logits_output.next_token_logprobs = token_logprobs.reshape(bs, max_accept)
+
+    if batch.sampling_info.need_return_top_p_token_ids:
+        valid_accept_mask = (
+            torch.arange(max_accept, device=device).view(1, -1)
+            < accept_lens.view(-1, 1)
+        ).reshape(-1)
+        request_mask = (
+            torch.repeat_interleave(
+                batch.sampling_info.return_top_p_token_ids, max_accept
+            )
+            & valid_accept_mask
+        )
+
+        if batch.sampling_info.is_all_greedy:
+            logits_output.next_token_top_p_token_ids = [
+                (
+                    accepted_token_ids[i : i + 1].to(torch.int32)
+                    if bool(request_mask[i].item())
+                    else None
+                )
+                for i in range(bs * max_accept)
+            ]
+        else:
+            if temperatures is None:
+                temperatures = torch.repeat_interleave(
+                    batch.sampling_info.temperatures,
+                    max_accept,
+                    dim=0,
+                )
+            probs = torch.softmax(gathered_logits / temperatures, dim=-1)
+            expanded_top_ks = torch.repeat_interleave(
+                batch.sampling_info.top_ks, max_accept
+            )
+            expanded_top_ps = torch.repeat_interleave(
+                batch.sampling_info.top_ps, max_accept
+            )
+            expanded_min_ps = torch.repeat_interleave(
+                batch.sampling_info.min_ps, max_accept
+            )
+            top_p_token_ids = get_top_p_token_ids_from_probs(
+                probs=probs,
+                top_ks=expanded_top_ks,
+                top_ps=expanded_top_ps,
+                min_ps=expanded_min_ps,
+                need_top_p_sampling=batch.sampling_info.need_top_p_sampling,
+                need_min_p_sampling=False,
+                request_mask=request_mask,
+            )
+            if top_p_token_ids is not None:
+                logits_output.next_token_top_p_token_ids = top_p_token_ids
+
+            renorm_logprobs = renorm_logprob_over_top_p(
+                probs=probs,
+                top_ks=expanded_top_ks,
+                top_ps=expanded_top_ps,
+                min_ps=expanded_min_ps,
+                need_top_p_sampling=batch.sampling_info.need_top_p_sampling,
+                need_min_p_sampling=False,
+                request_mask=request_mask,
+                # Force-keep the accepted token: a small fraction of
+                # speculatively accepted tokens land outside their own top-p
+                # nucleus, which would give a -inf renormalized logprob.
+                # Force-keeping makes the denominator ``nucleus ∪ {accepted}``,
+                # matching the trainer which also force-keeps the target token,
+                # so these tokens stay finite and on-policy.
+                force_keep_token_ids=accepted_token_ids.long(),
+            )
+            if renorm_logprobs is not None:
+                idx = torch.arange(bs * max_accept, device=device)
+                renorm_token_logprobs = renorm_logprobs[idx, accepted_token_ids.long()]
+                renorm_token_logprobs.clamp_(
+                    min=torch.finfo(renorm_token_logprobs.dtype).min
+                )
+                logits_output.next_token_logprobs = renorm_token_logprobs.reshape(
+                    bs, max_accept
+                )
 
     if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
         top_logprobs_nums_expanded = [

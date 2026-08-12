@@ -492,7 +492,15 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
-        if get_global_server_args().enable_deterministic_inference:
+        server_args = get_global_server_args()
+        if server_args.enable_deterministic_inference:
+            if server_args.enable_fp32_moe_router:
+                from sglang.srt.batch_invariant_ops import router_gemm_batch_invariant
+
+                return router_gemm_batch_invariant(
+                    hidden_states.contiguous(),
+                    self.weight.contiguous(),
+                )
             return F.linear(hidden_states, self.weight, None)
 
         if (

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
 from collections import deque
@@ -32,6 +33,8 @@ if TYPE_CHECKING:
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+MAX_PD_TOP_P_TOKEN_IDS = 4096
+logger = logging.getLogger(__name__)
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
@@ -276,6 +279,12 @@ class MetadataBuffers:
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
+            self.output_top_p_token_ids_len = torch.zeros(
+                (size, 16), dtype=torch.int32, device=device
+            )
+            self.output_top_p_token_ids = torch.zeros(
+                (size, MAX_PD_TOP_P_TOKEN_IDS), dtype=torch.int32, device=device
+            )
             # For PD + spec decode
             self.output_topk_p = torch.zeros(
                 (size, 16), dtype=torch.float32, device=device
@@ -308,6 +317,8 @@ class MetadataBuffers:
             self.output_token_logprobs_idx.data_ptr(),
             self.output_top_logprobs_val.data_ptr(),
             self.output_top_logprobs_idx.data_ptr(),
+            self.output_top_p_token_ids_len.data_ptr(),
+            self.output_top_p_token_ids.data_ptr(),
             self.output_topk_p.data_ptr(),
             self.output_topk_index.data_ptr(),
             self.output_hidden_states.data_ptr(),
@@ -320,6 +331,8 @@ class MetadataBuffers:
             self.output_token_logprobs_idx.nbytes,
             self.output_top_logprobs_val.nbytes,
             self.output_top_logprobs_idx.nbytes,
+            self.output_top_p_token_ids_len.nbytes,
+            self.output_top_p_token_ids.nbytes,
             self.output_topk_p.nbytes,
             self.output_topk_index.nbytes,
             self.output_hidden_states.nbytes,
@@ -332,6 +345,8 @@ class MetadataBuffers:
             self.output_token_logprobs_idx[0].nbytes,
             self.output_top_logprobs_val[0].nbytes,
             self.output_top_logprobs_idx[0].nbytes,
+            self.output_top_p_token_ids_len[0].nbytes,
+            self.output_top_p_token_ids[0].nbytes,
             self.output_topk_p[0].nbytes,
             self.output_topk_index[0].nbytes,
             self.output_hidden_states[0].nbytes,
@@ -351,6 +366,8 @@ class MetadataBuffers:
             self.output_token_logprobs_idx[idx].clone(),
             self.output_top_logprobs_val[idx].clone(),
             self.output_top_logprobs_idx[idx].clone(),
+            self.output_top_p_token_ids_len[idx].clone(),
+            self.output_top_p_token_ids[idx].clone(),
             self.output_topk_p[idx].clone(),
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
@@ -383,6 +400,7 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        self.output_top_p_token_ids_len[req.metadata_buffer_index][0] = 0
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
@@ -408,6 +426,28 @@ class MetadataBuffers:
                     req.logprob.output_top_logprobs_idx[0],
                     dtype=torch.int32,
                     device="cpu",
+                )
+            if req.logprob.output_top_p_token_ids:  # not none or empty list
+                output_top_p_token_ids = req.logprob.output_top_p_token_ids[0]
+                if len(output_top_p_token_ids) > MAX_PD_TOP_P_TOKEN_IDS:
+                    logger.warning(
+                        "PD top-p token replay payload for the first output token "
+                        "has %s ids, exceeding the metadata buffer cap %s. "
+                        "Falling back to the sampled token only.",
+                        len(output_top_p_token_ids),
+                        MAX_PD_TOP_P_TOKEN_IDS,
+                    )
+                    output_top_p_token_ids = [int(req.output_ids[0])]
+                top_p_len = len(output_top_p_token_ids)
+                self.output_top_p_token_ids_len[req.metadata_buffer_index][
+                    0
+                ] = top_p_len
+                self.output_top_p_token_ids[req.metadata_buffer_index][:top_p_len] = (
+                    torch.tensor(
+                        output_top_p_token_ids,
+                        dtype=torch.int32,
+                        device="cpu",
+                    )
                 )
         # For PD + spec decode
         if req.hidden_states_tensor is not None:

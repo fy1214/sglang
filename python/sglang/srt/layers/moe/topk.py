@@ -1393,6 +1393,20 @@ def biased_grouped_topk_gpu(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        return biased_grouped_topk_impl.__wrapped__(
+            hidden_states,
+            gating_output,
+            correction_bias,
+            topk,
+            renormalize,
+            num_expert_group,
+            topk_group,
+            num_fused_shared_experts=num_fused_shared_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
+
     num_tokens = gating_output.shape[0]
     num_experts = gating_output.shape[1]
     experts_per_group = (

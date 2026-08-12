@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -168,6 +169,15 @@ def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
     return backend_name in ("dsa", "nsa")
 
 
+def _match_head_gate_q_scale(
+    weights: torch.Tensor, q_scale: torch.Tensor
+) -> torch.Tensor:
+    if weights.shape[1] < q_scale.shape[1]:
+        assert q_scale.shape[1] % weights.shape[1] == 0
+        weights = weights.repeat_interleave(q_scale.shape[1] // weights.shape[1], dim=1)
+    return weights
+
+
 if _is_cuda:
     from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_quant
     from sglang.jit_kernel.dsv32 import (
@@ -223,6 +233,7 @@ if _is_cuda:
     ) -> torch.Tensor:
         out = torch.mm(x, weight.t(), out_dtype=torch.float32)
         weights = out * n_heads_inv_sqrt
+        weights = _match_head_gate_q_scale(weights, q_scale)
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
 
@@ -440,6 +451,15 @@ class Indexer(MultiPlatformOp):
         self.k_norm = LayerNorm(
             self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
         )
+        server_args = get_global_server_args()
+        env_neox_style = os.environ.get("INDEXER_ROPE_NEOX_STYLE")
+        if env_neox_style is not None:
+            if env_neox_style not in ("0", "1"):
+                raise ValueError(
+                    "INDEXER_ROPE_NEOX_STYLE must be either '0' or '1' when set."
+                )
+            is_neox_style = env_neox_style == "1"
+
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
             rotary_dim=rope_head_dim,
@@ -447,7 +467,7 @@ class Indexer(MultiPlatformOp):
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
             is_neox_style=is_neox_style,
-            device=get_global_server_args().device,
+            device=server_args.device,
         )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
@@ -485,6 +505,19 @@ class Indexer(MultiPlatformOp):
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
         if _is_cuda:
+            if get_global_server_args().enable_deterministic_inference:
+                flat_input = x.reshape(-1, x.shape[-1]).contiguous()
+                output = torch.empty(
+                    (flat_input.shape[0], self.weights_proj.weight.shape[0]),
+                    dtype=torch.float32,
+                    device=flat_input.device,
+                )
+                deep_gemm_wrapper.gemm_nt_bf16bf16f32(
+                    flat_input,
+                    self.weights_proj.weight.contiguous(),
+                    output,
+                )
+                return output.view(*x.shape[:-1], self.weights_proj.weight.shape[0])
             return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
 
         weights, _ = self.weights_proj(x)
@@ -507,6 +540,7 @@ class Indexer(MultiPlatformOp):
     ):
         weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
+        weights = _match_head_gate_q_scale(weights, q_scale)
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
 
@@ -514,6 +548,7 @@ class Indexer(MultiPlatformOp):
     def _apply_q_scale_and_softmax_scale(
         self, weights: torch.Tensor, q_scale: torch.Tensor
     ):
+        weights = _match_head_gate_q_scale(weights, q_scale)
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     @torch.compile(dynamic=True)
@@ -538,6 +573,12 @@ class Indexer(MultiPlatformOp):
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
             return max_kv_len <= self.index_topk
         return False
+
+    def _maybe_repeat_query_heads(self, query: torch.Tensor) -> torch.Tensor:
+        if query.shape[1] < 32:
+            assert 32 % query.shape[1] == 0
+            query = query.repeat_interleave(32 // query.shape[1], dim=1)
+        return query
 
     def _get_q_k_bf16(
         self,
@@ -1770,6 +1811,7 @@ class Indexer(MultiPlatformOp):
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
+            query = self._maybe_repeat_query_heads(query)
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             with torch.cuda.stream(self.alt_stream):
                 self._store_index_k_cache(
@@ -1787,6 +1829,7 @@ class Indexer(MultiPlatformOp):
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
+            query = self._maybe_repeat_query_heads(query)
 
             if enable_dual_stream:
                 current_stream = torch.cuda.current_stream()

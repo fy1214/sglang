@@ -1678,7 +1678,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(
-                batch, logits_output, predict, accept_index, self.speculative_num_steps
+                batch,
+                logits_output,
+                predict,
+                accept_index,
+                accept_lens,
+                self.speculative_num_steps,
             )
 
         if not batch.forward_mode.is_idle() and self.topk > 1:

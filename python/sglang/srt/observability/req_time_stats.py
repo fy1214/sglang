@@ -346,7 +346,7 @@ class ReqTimeStatsBase:
                 state["trace_ctx"] = TraceNullContext()
 
         for key in state.keys():
-            if key.endswith("time"):
+            if key.endswith("time") and state[key] > 0.0:
                 state[key] = convert_time_cross_thread(
                     state[key],
                     state["diff_realtime_monotonic"],
@@ -632,9 +632,20 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             return {}
 
         state = {
+            "enable_metrics": self.enable_metrics,
+            "disagg_mode": self.disagg_mode,
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
+            "completion_time": self.completion_time,
+            "prefill_bootstrap_queue_entry_time": self.prefill_bootstrap_queue_entry_time,
+            "prefill_transfer_queue_entry_time": self.prefill_transfer_queue_entry_time,
+            "decode_prealloc_queue_entry_time": self.decode_prealloc_queue_entry_time,
+            "decode_transfer_queue_entry_time": self.decode_transfer_queue_entry_time,
+            "bootstrap_done_time": self.bootstrap_done_time,
+            "transfer_speed_gb_s": self.transfer_speed_gb_s,
+            "transfer_total_mb": self.transfer_total_mb,
+            "prefill_retry_count": self.prefill_retry_count,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
@@ -1150,6 +1161,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def convert_to_output_meta_info(self):
         meta_data = {}
+
+        def add_duration(key: str, start: float, end: float):
+            if start > 0.0 and end > 0.0:
+                duration = end - start
+                if duration >= 0.0:
+                    meta_data[key] = duration
+
         if self.forward_entry_time > 0.0:
             meta_data["forward_entry_time"] = convert_time_to_realtime(
                 self.forward_entry_time
@@ -1163,6 +1181,67 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 "queue_time": self.get_queueing_time(),
             }
         )
+        if self.disagg_mode == DisaggregationMode.PREFILL:
+            add_duration(
+                "pd_prefill_bootstrap_queue_duration",
+                self.prefill_bootstrap_queue_entry_time,
+                self.wait_queue_entry_time,
+            )
+            add_duration(
+                "pd_prefill_bootstrap_duration",
+                self.prefill_bootstrap_queue_entry_time,
+                self.bootstrap_done_time,
+            )
+            add_duration(
+                "pd_prefill_alloc_wait_duration",
+                self.bootstrap_done_time,
+                self.wait_queue_entry_time,
+            )
+            add_duration(
+                "pd_prefill_forward_duration",
+                self.forward_entry_time,
+                self.completion_time,
+            )
+            add_duration(
+                "pd_prefill_transfer_queue_duration",
+                self.prefill_transfer_queue_entry_time,
+                self.completion_time,
+            )
+            if self.transfer_speed_gb_s > 0.0:
+                meta_data["pd_transfer_speed_gb_s"] = self.transfer_speed_gb_s
+            if self.transfer_total_mb > 0.0:
+                meta_data["pd_transfer_total_mb"] = self.transfer_total_mb
+            meta_data["pd_prefill_retry_count"] = self.prefill_retry_count
+        elif self.disagg_mode == DisaggregationMode.DECODE:
+            add_duration(
+                "pd_decode_prealloc_duration",
+                self.decode_prealloc_queue_entry_time,
+                self.decode_transfer_queue_entry_time,
+            )
+            add_duration(
+                "pd_decode_bootstrap_duration",
+                self.decode_prealloc_queue_entry_time,
+                self.bootstrap_done_time,
+            )
+            add_duration(
+                "pd_decode_alloc_wait_duration",
+                self.bootstrap_done_time,
+                self.decode_transfer_queue_entry_time,
+            )
+            add_duration(
+                "pd_decode_transfer_duration",
+                self.decode_transfer_queue_entry_time,
+                self.wait_queue_entry_time,
+            )
+            add_duration(
+                "pd_decode_forward_duration",
+                self.forward_entry_time,
+                self.completion_time,
+            )
+            if self.transfer_speed_gb_s > 0.0:
+                meta_data["pd_transfer_speed_gb_s"] = self.transfer_speed_gb_s
+            if self.transfer_total_mb > 0.0:
+                meta_data["pd_transfer_total_mb"] = self.transfer_total_mb
         return meta_data
 
     def format_duration(self, duration: float) -> str:

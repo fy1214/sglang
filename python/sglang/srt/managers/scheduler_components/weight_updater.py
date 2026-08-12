@@ -26,6 +26,10 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PostProcessWeightsReqInput,
+    PostProcessWeightsReqOutput,
+    PullWeightsReqInput,
+    PullWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -181,6 +185,19 @@ class SchedulerWeightUpdaterManager:
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter=parameter)
 
+    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
+        success, message = self.tp_worker.post_process_weights(recv_req)
+        if (
+            success
+            and self.draft_worker is not None
+            and hasattr(self.draft_worker, "post_process_weights")
+        ):
+            success, message = self.draft_worker.post_process_weights(recv_req)
+        if not success:
+            logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return PostProcessWeightsReqOutput(success=success, message=message)
+
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         assert (
             self.is_fully_idle()
@@ -191,10 +208,18 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
+        tags_to_offload = []
         for tag in tags:
+            if tag not in self.offload_tags and tag not in tags_to_offload:
+                tags_to_offload.append(tag)
+
+        if not tags_to_offload:
+            return ReleaseMemoryOccupationReqOutput()
+
+        for tag in tags_to_offload:
             self.offload_tags.add(tag)
 
-        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+        if GPU_MEMORY_TYPE_KV_CACHE in tags_to_offload:
             scheduler = self.scheduler
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
@@ -211,15 +236,21 @@ class SchedulerWeightUpdaterManager:
                         queue.release_memory_occupation()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
+            if scheduler is not None and scheduler.server_args.release_hicache:
+                release = getattr(
+                    scheduler.tree_cache, "release_memory_occupation", None
+                )
+                if release is not None:
+                    release()
 
-        if GPU_MEMORY_TYPE_WEIGHTS in tags:
+        if GPU_MEMORY_TYPE_WEIGHTS in tags_to_offload:
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
             )
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
-        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags_to_offload:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         torch.get_device_module().synchronize()
@@ -232,13 +263,21 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
+        tags_to_resume = []
         for tag in tags:
+            if tag in self.offload_tags and tag not in tags_to_resume:
+                tags_to_resume.append(tag)
+
+        if not tags_to_resume:
+            return ResumeMemoryOccupationReqOutput()
+
+        for tag in tags_to_resume:
             self.offload_tags.remove(tag)
 
-        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags_to_resume:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
-        if GPU_MEMORY_TYPE_WEIGHTS in tags:
+        if GPU_MEMORY_TYPE_WEIGHTS in tags_to_resume:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             torch.distributed.barrier(self.tp_cpu_group)
             _import_static_state(
@@ -247,10 +286,16 @@ class SchedulerWeightUpdaterManager:
             )
             del self.stashed_model_static_state
 
-        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+        if GPU_MEMORY_TYPE_KV_CACHE in tags_to_resume:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
             scheduler = self.scheduler
             if scheduler is not None:
+                if scheduler.server_args.release_hicache:
+                    resume = getattr(
+                        scheduler.tree_cache, "resume_memory_occupation", None
+                    )
+                    if resume is not None:
+                        resume()
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                     for queue_name in (
                         "disagg_decode_transfer_queue",
@@ -265,6 +310,40 @@ class SchedulerWeightUpdaterManager:
                         queue.resume_memory_occupation()
 
         return ResumeMemoryOccupationReqOutput()
+
+    def pull_weights(self, recv_req: PullWeightsReqInput):
+        """Sync this host's local checkpoint up to recv_req.target_version.
+
+        Every rank runs the pull; a per-host file lock collapses co-located
+        ranks to one pull. Success is gathered across the TP group (all nodes),
+        so the reply only reports success once every host holds a verified
+        checkpoint.
+        """
+        from sglang.srt.weight_sync import local_checkpoint
+
+        server_args = self.tp_worker.model_runner.server_args
+        try:
+            local_checkpoint.pull(
+                local_checkpoint_dir=recv_req.local_checkpoint_dir,
+                base_dir=server_args.model_path,
+                source_dir=recv_req.source_dir,
+                target_version=recv_req.target_version,
+                pre_read_hook=server_args.custom_pull_weights_pre_read_hook,
+            )
+            success, message = True, "Success."
+        except Exception:
+            success, message = False, traceback.format_exc()
+            logger.error(message)
+
+        tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+        if tp_size > 1:
+            results = [None] * tp_size
+            torch.distributed.all_gather_object(
+                results, (success, message), group=self.tp_cpu_group
+            )
+            success = all(ok for ok, _ in results)
+            message = "; ".join(msg for ok, msg in results if not ok) or message
+        return PullWeightsReqOutput(success=success, message=message)
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:

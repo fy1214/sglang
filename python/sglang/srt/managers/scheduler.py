@@ -126,7 +126,9 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PostProcessWeightsReqInput,
     ProfileReq,
+    PullWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1417,6 +1419,10 @@ class Scheduler(
                     self.weight_updater.update_weights_from_ipc,
                 ),
                 (
+                    PostProcessWeightsReqInput,
+                    self.weight_updater.post_process_weights,
+                ),
+                (
                     GetWeightsByNameReqInput,
                     self.weight_updater.get_weights_by_name,
                 ),
@@ -1431,6 +1437,10 @@ class Scheduler(
                 (
                     CheckWeightsReqInput,
                     self.weight_updater.check_weights,
+                ),
+                (
+                    PullWeightsReqInput,
+                    self.weight_updater.pull_weights,
                 ),
                 (SlowDownReqInput, self.slow_down),
                 (
@@ -3988,6 +3998,12 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
+                if self.disaggregation_mode == DisaggregationMode.PREFILL and hasattr(
+                    req, "disagg_kv_sender"
+                ):
+                    sender = getattr(req, "disagg_kv_sender", None)
+                    if sender is not None and hasattr(sender, "abort"):
+                        sender.abort()
                 req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:

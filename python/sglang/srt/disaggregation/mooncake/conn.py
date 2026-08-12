@@ -851,7 +851,7 @@ class MooncakeKVManager(CommonKVManager):
         for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
+            dst_addr = dst_aux_ptr + length * req.dst_aux_index
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
@@ -1354,12 +1354,6 @@ class MooncakeKVManager(CommonKVManager):
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
-                                    self.failed_sessions.add(req.mooncake_session_id)
-                                    logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
-                                    )
                             self.record_failure(
                                 kv_chunk.room,
                                 f"Failed to send kv chunk of {kv_chunk.room} to "
@@ -1377,12 +1371,27 @@ class MooncakeKVManager(CommonKVManager):
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices:
-                                self.maybe_send_extra(
+                                ret = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                if ret != 0:
+                                    self.record_failure(
+                                        kv_chunk.room,
+                                        f"Failed to send extra state of {kv_chunk.room} to "
+                                        f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                    )
+                                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                                    self.sync_status_to_decode_endpoint(
+                                        req.endpoint,
+                                        req.dst_port,
+                                        req.room,
+                                        KVPoll.Failed,
+                                        prefill_unique_rank,
+                                    )
+                                    break
 
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(

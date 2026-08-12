@@ -114,7 +114,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.element_dim * self.dtype.itemsize
         )
+        self._post_init_host_buffers()
 
+    def _post_init_host_buffers(self) -> None:
         if self.layout == "page_first":
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
@@ -686,6 +688,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
 
         self.init_kv_buffer()
         self.lock = threading.RLock()
+        self._host_memory_released = False
         self.clear()
 
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
@@ -696,6 +699,15 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        self._post_init_host_buffers()
+
+    def _host_buffer_attr_names(self):
+        return ("k_buffer",)
+
+    def _init_host_buffers(self) -> None:
+        self.init_kv_buffer()
+
+    def _post_init_host_buffers(self) -> None:
         if self.layout == "page_first":
             transposed = self.k_buffer.transpose(0, 1)
             self.k_data_refs = [transposed[i] for i in range(self.layer_num)]
@@ -1285,7 +1297,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
         )
+        self._post_init_host_buffers()
 
+    def _host_buffer_attr_names(self):
+        return ("kv_buffer", "k_buffer", "v_buffer", "index_k_buffer")
+
+    def _post_init_host_buffers(self) -> None:
         if self.layout == "page_first":
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
@@ -1801,7 +1818,17 @@ class MambaPoolHost(HostKVCache):
         self.init_kv_buffer()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
+        self._host_memory_released = False
         self.clear()
+
+    def _host_buffer_attr_names(self):
+        return ("temporal_buffer", "conv_buffer")
+
+    def _init_host_buffers(self) -> None:
+        self.init_kv_buffer()
+
+    def _post_init_host_buffers(self) -> None:
+        self._init_write_back_staging_buffers()
 
     def init_kv_buffer(self):
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
@@ -2360,6 +2387,12 @@ class LogicalHostPool:
 
     def get_ksize_per_token(self):
         return 0
+
+    def release_memory_occupation(self) -> None:
+        pass
+
+    def resume_memory_occupation(self) -> None:
+        pass
 
 
 class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
@@ -3183,6 +3216,18 @@ class HostPoolGroup:
         for entry in self.entries:
             entry.host_pool.clear()
 
+    def release_memory_occupation(self) -> None:
+        for entry in self.entries:
+            release = getattr(entry.host_pool, "release_memory_occupation", None)
+            if release is not None:
+                release()
+
+    def resume_memory_occupation(self) -> None:
+        for entry in self.entries:
+            resume = getattr(entry.host_pool, "resume_memory_occupation", None)
+            if resume is not None:
+                resume()
+
     def available_size(self):
         return self.anchor_entry.host_pool.available_size()
 
@@ -3330,7 +3375,25 @@ class DSAIndexerPoolHost(HostKVCache):
         self.can_use_write_back_jit = False
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
+        self._host_memory_released = False
         self.clear()
+
+    def _requested_host_memory_bytes(self) -> int:
+        return (
+            self.page_num
+            * self.layer_num
+            * self.indexer_page_stride_size
+            * self.indexer_dtype.itemsize
+        )
+
+    def _host_buffer_attr_names(self):
+        return ("index_k_with_scale_buffer",)
+
+    def _init_host_buffers(self) -> None:
+        self.init_kv_buffer()
+
+    def _post_init_host_buffers(self) -> None:
+        self._init_write_back_staging_buffers()
 
     def get_size_per_token(self):
         return (
