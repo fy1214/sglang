@@ -1,0 +1,270 @@
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index c2187e5e3..0452a39c8 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -1284,21 +1284,33 @@ class FlashInferFP4MoE(FusedMoE):
+         hs_sf = a_sf.view(torch.float8_e4m3fn).reshape(seq_len, hidden_size // 16)
+         return hs_fp4, hs_sf, per_token_scale
+ 
++    @staticmethod
++    def _accepts_topk_output(topk_output: TopKOutput) -> bool:
++        if TopKOutputChecker.format_is_bypassed(topk_output):
++            return True
++        return (
++            TopKOutputChecker.format_is_standard(topk_output)
++            and get_global_server_args().enable_return_routed_experts
++        )
++
+     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+-        assert TopKOutputChecker.format_is_bypassed(
+-            topk_output
+-        ), "Only bypassed topk output is supported for flashinfer fp4 moe"
++        assert self._accepts_topk_output(topk_output), (
++            "Only bypassed topk output is supported for flashinfer fp4 moe, "
++            "unless --enable-return-routed-experts is set"
++        )
+ 
+         if is_in_piecewise_cuda_graph():
+-            return flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
+-                hidden_states,
+-                topk_output.router_logits,
+-                topk_output.topk_config.top_k,
+-                topk_output.topk_config.topk_group,
+-                topk_output.topk_config.num_expert_group,
+-                topk_output.topk_config.correction_bias,
+-                self.layer_id,
+-            )
++            if TopKOutputChecker.format_is_bypassed(topk_output):
++                return flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
++                    hidden_states,
++                    topk_output.router_logits,
++                    topk_output.topk_config.top_k,
++                    topk_output.topk_config.topk_group,
++                    topk_output.topk_config.num_expert_group,
++                    topk_output.topk_config.correction_bias,
++                    self.layer_id,
++                )
++            return self.forward_impl(hidden_states, topk_output)
+         else:
+             return self.forward_impl(hidden_states, topk_output)
+ 
+@@ -1307,7 +1319,7 @@ class FlashInferFP4MoE(FusedMoE):
+ 
+         Args:
+             hidden_states: Input tensor
+-            topk_output: TopKOutput object with Bypassed format
++            topk_output: TopKOutput object with Bypassed or Standard (R3) format
+         """
+         assert isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+ 
+@@ -1315,8 +1327,6 @@ class FlashInferFP4MoE(FusedMoE):
+             self.moe_runner_config.is_gated
+         ), "Only gated MoEs are supported for flashinfer fp4 moe"
+ 
+-        assert TopKOutputChecker.format_is_bypassed(topk_output)
+-
+         if (
+             NVFP4_PERTOKEN_SCALE
+             and get_moe_runner_backend().is_flashinfer_trtllm()
+@@ -1325,6 +1335,8 @@ class FlashInferFP4MoE(FusedMoE):
+         ):
+             return FusedMoE.forward_impl(self, hidden_states, topk_output)
+ 
++        assert TopKOutputChecker.format_is_bypassed(topk_output)
++
+         router_logits = topk_output.router_logits
+         topk_config = topk_output.topk_config
+ 
+diff --git a/python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py b/python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py
+index 522f08288..9552bffdd 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py
++++ b/python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py
+@@ -423,17 +423,29 @@ def quantize_hidden_states_fp4_pertoken(
+     return hs_fp4, hs_sf, per_token_scale
+ 
+ 
++def _pack_topk_ids(topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> torch.Tensor:
++    """Pack expert id (high 16 bits) and bf16 weight bits (low 16 bits) for routed MoE."""
++    weight_bits = (
++        topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
++    )
++    return (topk_ids.to(torch.int32) << 16) | weight_bits
++
++
+ def fused_experts_none_to_flashinfer_trtllm_fp4(
+     dispatch_output: StandardDispatchOutput,
+     quant_info: FlashInferTrtllmFp4MoeQuantInfo,
+     runner_config: MoeRunnerConfig,
++    use_routed_topk: bool = False,
+ ) -> StandardCombineInput:
+     """FlashInfer TRTLLM FP4 MoE forward pass.
+ 
+     This function handles the FP4 TRTLLM MoE path that was previously in
+     FlashInferFP4MoE.forward_impl and ModelOptNvFp4FusedMoEMethod.apply.
+     """
+-    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
++    from flashinfer.fused_moe import (
++        trtllm_fp4_block_scale_moe,
++        trtllm_fp4_block_scale_routed_moe,
++    )
+ 
+     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+     from sglang.srt.layers.moe.topk import TopKOutputChecker
+@@ -444,11 +456,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
+ 
+     hidden_states = dispatch_output.hidden_states
+     topk_output = dispatch_output.topk_output
+-    assert TopKOutputChecker.format_is_bypassed(topk_output)
+ 
+-    router_logits = topk_output.router_logits
+-    topk_config = topk_output.topk_config
+-    routing_method_type = quant_info.routing_method_type
++    # R3 materializes topk in SGLang; auto-switch to the routed FlashInfer kernel.
++    if not use_routed_topk and TopKOutputChecker.format_is_standard(topk_output):
++        use_routed_topk = True
+ 
+     # Quantize hidden states to FP4
+     per_token_scale = None
+@@ -461,16 +472,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
+             hidden_states, quant_info.w13_input_scale_quant
+         )
+ 
+-    # DeepSeekV3 style routing requires float32 router logits
+-    if routing_method_type == RoutingMethodType.DeepSeekV3:
+-        router_logits = router_logits.to(torch.float32)
+-
+-    correction_bias = (
+-        None
+-        if topk_config.correction_bias is None
+-        else topk_config.correction_bias.to(hidden_states.dtype)
+-    )
+-
+     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+         num_tokens = hs_fp4.shape[0]
+         hidden_size = (
+@@ -480,44 +481,77 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
+             num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
+         )
+ 
+-    result = trtllm_fp4_block_scale_moe(
+-        routing_logits=router_logits,
+-        routing_bias=correction_bias,
++    hs_scale = hs_scale_linear.view(torch.float8_e4m3fn)
++    gemm1_weights_scale = quant_info.gemm1_scales_fp4_shuffled.view(torch.float8_e4m3fn)
++    gemm2_weights_scale = quant_info.gemm2_scales_fp4_shuffled.view(torch.float8_e4m3fn)
++    moe_common_kwargs = dict(
+         hidden_states=hs_fp4,
+-        hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn),
++        hidden_states_scale=hs_scale,
+         gemm1_weights=quant_info.gemm1_weights_fp4_shuffled,
+-        gemm1_weights_scale=quant_info.gemm1_scales_fp4_shuffled.view(
+-            torch.float8_e4m3fn
+-        ),
++        gemm1_weights_scale=gemm1_weights_scale,
+         gemm1_bias=None,
+         gemm1_alpha=None,
+         gemm1_beta=None,
+         gemm1_clamp_limit=None,
+         gemm2_weights=quant_info.gemm2_weights_fp4_shuffled,
+-        gemm2_weights_scale=quant_info.gemm2_scales_fp4_shuffled.view(
+-            torch.float8_e4m3fn
+-        ),
++        gemm2_weights_scale=gemm2_weights_scale,
+         gemm2_bias=None,
+         output1_scale_scalar=quant_info.g1_scale_c,
+         output1_scale_gate_scalar=quant_info.g1_alphas,
+         output2_scale_scalar=quant_info.g2_alphas,
+         num_experts=quant_info.global_num_experts,
+-        top_k=topk_config.top_k,
+-        n_group=topk_config.num_expert_group,
+-        topk_group=topk_config.topk_group,
+         intermediate_size=quant_info.intermediate_size_per_partition,
+         local_expert_offset=quant_info.local_expert_offset,
+         local_num_experts=quant_info.local_num_experts,
++        do_finalize=True,
++        per_token_scale=per_token_scale,
++        tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
++        output=symm_output,
++    )
++
++    if use_routed_topk:
++        assert TopKOutputChecker.format_is_standard(topk_output)
++        packed_topk_ids = _pack_topk_ids(topk_output.topk_ids, topk_output.topk_weights)
++        result = trtllm_fp4_block_scale_routed_moe(
++            topk_ids=packed_topk_ids,
++            routing_bias=None,
++            top_k=topk_output.topk_ids.shape[1],
++            n_group=0,
++            topk_group=0,
++            routed_scaling_factor=None,
++            routing_method_type=1,  # Unused for precomputed routing; must be 1.
++            **moe_common_kwargs,
++        )[0]
++        return StandardCombineInput(hidden_states=result)
++
++    assert TopKOutputChecker.format_is_bypassed(topk_output)
++    router_logits = topk_output.router_logits
++    topk_config = topk_output.topk_config
++    routing_method_type = quant_info.routing_method_type
++
++    # DeepSeekV3 style routing requires float32 router logits
++    if routing_method_type == RoutingMethodType.DeepSeekV3:
++        router_logits = router_logits.to(torch.float32)
++
++    correction_bias = (
++        None
++        if topk_config.correction_bias is None
++        else topk_config.correction_bias.to(hidden_states.dtype)
++    )
++
++    result = trtllm_fp4_block_scale_moe(
++        routing_logits=router_logits,
++        routing_bias=correction_bias,
++        top_k=topk_config.top_k,
++        n_group=topk_config.num_expert_group,
++        topk_group=topk_config.topk_group,
+         routed_scaling_factor=runner_config.routed_scaling_factor,
+         routing_method_type=(
+             routing_method_type
+             if routing_method_type is not None
+             else RoutingMethodType.Default
+         ),
+-        do_finalize=True,
+-        per_token_scale=per_token_scale,
+-        tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
+-        output=symm_output,
++        **moe_common_kwargs,
+     )[0]
+ 
+     return StandardCombineInput(hidden_states=result)
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index a44fe5dc4..26235cd28 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -49,6 +49,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
+ from sglang.srt.layers.moe import get_moe_runner_backend
+ from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+ from sglang.srt.layers.utils import MultiPlatformOp
++from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import (
+     cpu_has_amx_support,
+     get_bool_env_var,
+@@ -281,10 +282,14 @@ class TopK(MultiPlatformOp):
+             output_format = self.topk_config.output_format
+         elif get_moe_runner_backend().is_triton_kernels():
+             output_format = TopKOutputFormat.TRITON_KERNEL
+-        elif (
+-            get_moe_runner_backend().is_flashinfer_trtllm()
+-            or get_moe_runner_backend().is_flashinfer_mxfp4()
+-        ):
++        elif get_moe_runner_backend().is_flashinfer_trtllm():
++            # R3 needs materialized topk_ids for routed-experts capture. Keep the
++            # fused bypassed path when rollout routing replay is disabled.
++            if get_global_server_args().enable_return_routed_experts:
++                output_format = TopKOutputFormat.STANDARD
++            else:
++                output_format = TopKOutputFormat.BYPASSED
++        elif get_moe_runner_backend().is_flashinfer_mxfp4():
+             output_format = TopKOutputFormat.BYPASSED
+         else:
+             output_format = TopKOutputFormat.STANDARD

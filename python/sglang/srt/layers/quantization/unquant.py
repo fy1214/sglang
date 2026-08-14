@@ -17,6 +17,7 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -243,8 +244,28 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             torch.cuda.empty_cache()
 
         # Pack weight for get better performance on CPU
-        if _is_cpu and _is_cpu_amx_available:
-            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+        if envs.SGLANG_NVFP4_PERTOKEN_SCALE.get():
+            from transformer_engine.pytorch import NVFP4Quantizer
+
+            nvfp4_quantizer = NVFP4Quantizer(
+                rowwise=True,
+                columnwise=False,
+                with_amax_reduction=False,
+                amax_reduction_group=None,
+                with_rht=False,
+                with_post_rht_amax=False,
+                with_2d_quantization=False,
+                stochastic_rounding=False,
+            )
+            for i in range(layer.num_local_experts):
+                w13 = layer.w13_weight.data[i]
+                w2 = layer.w2_weight.data[i]
+                w13_q = nvfp4_quantizer(w13)
+                w2_q = nvfp4_quantizer(w2)
+                w13_qdq = w13_q.dequantize()
+                w2_qdq = w2_q.dequantize()
+                layer.w13_weight.data[i] = w13_qdq.view(torch.bfloat16).contiguous()
+                layer.w2_weight.data[i] = w2_qdq.view(torch.bfloat16).contiguous()
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
@@ -401,6 +422,28 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+
+        if envs.SGLANG_NVFP4_PERTOKEN_SCALE.get():
+            from miniTransformer.ops.nvfp4_quantize import (
+                _get_fp4_grid,
+                dequantize_nvfp4_pertoken,
+                quantize_nvfp4_pertoken,
+            )
+
+            _get_fp4_grid(
+                x.device
+            )  # ensure lru_cache populated before any graph capture
+            _orig_dtype = x.dtype
+            _m, _k = x.shape
+            _k_pad = ((_k + 127) // 128) * 128
+            if _k_pad != _k:
+                _x_pad = torch.zeros(_m, _k_pad, dtype=torch.bfloat16, device=x.device)
+                _x_pad[:, :_k] = x
+            else:
+                _x_pad = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+            _qresult = quantize_nvfp4_pertoken(_x_pad)
+            x = dequantize_nvfp4_pertoken(_qresult).to(_orig_dtype)[:, :_k]
+            dispatch_output = dispatch_output._replace(hidden_states=x)
 
         moe_runner_config = self.moe_runner_config
 

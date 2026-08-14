@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.environ import envs
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -580,6 +581,49 @@ def fused_experts_impl(
         else:
             raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
+        # --- FC2 input: apply probs + QDQ to match Megatron training ---
+        # Megatron: SwiGLU -> x*probs -> NVFP4 quantize -> FC2
+        # Without this block: SwiGLU -> FC2 -> x*probs (probs at FC2 output)
+        if envs.SGLANG_NVFP4_PERTOKEN_SCALE.get():
+            from miniTransformer.ops.nvfp4_quantize import (
+                _get_fp4_grid,
+                dequantize_nvfp4_pertoken,
+                quantize_nvfp4_pertoken,
+            )
+
+            if not apply_router_weight_on_input:
+                intermediate_cache2 = intermediate_cache2 * curr_topk_weights.view(
+                    -1, 1
+                ).to(intermediate_cache2.dtype)
+                _fc2_probs_applied = True
+            else:
+                _fc2_probs_applied = False
+
+            _orig_dtype2 = intermediate_cache2.dtype
+            _m2, _k2 = intermediate_cache2.shape
+            _k2_pad = ((_k2 + 127) // 128) * 128
+            _get_fp4_grid(intermediate_cache2.device)
+            if _k2_pad != _k2:
+                _x2_pad = torch.zeros(
+                    _m2,
+                    _k2_pad,
+                    dtype=torch.bfloat16,
+                    device=intermediate_cache2.device,
+                )
+                _x2_pad[:, :_k2] = intermediate_cache2
+            else:
+                _x2_pad = (
+                    intermediate_cache2
+                    if intermediate_cache2.dtype == torch.bfloat16
+                    else intermediate_cache2.to(torch.bfloat16)
+                )
+            _qresult2 = quantize_nvfp4_pertoken(_x2_pad)
+            intermediate_cache2 = dequantize_nvfp4_pertoken(_qresult2).to(_orig_dtype2)[
+                :, :_k2
+            ]
+        else:
+            _fc2_probs_applied = False
+
         out_slice = None
         if use_fused_moe_sum_all_reduce:
             out_slice = out_hidden_states[begin_chunk_idx:end_chunk_idx]
@@ -606,7 +650,7 @@ def fused_experts_impl(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            not apply_router_weight_on_input,
+            not apply_router_weight_on_input and not _fc2_probs_applied,
             1,
             down_config or config,
             compute_type=compute_type,

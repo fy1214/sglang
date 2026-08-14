@@ -243,7 +243,6 @@ class Envs:
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
-    SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     # Extra slots in req_to_token_pool for decode workers (only effective when
     # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
     # can overlap with decode execution without raising max_running_requests.
@@ -264,12 +263,6 @@ class Envs:
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
-    # For non-streaming requests, the scheduler still flushes intermediate
-    # output batches to the tokenizer manager every N decoded tokens so that
-    # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
-    # an accurate TTFT for benchmarking; the upstream default of 50 trades
-    # off some TTFT-metric accuracy for less IPC overhead.
-    SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -517,8 +510,8 @@ class Envs:
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
 
-    # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
-    SGLANG_PATCH_TOKENIZER = EnvBool(True)
+    # Tokenizer
+    SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
 
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
@@ -536,6 +529,10 @@ class Envs:
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
 
     # Elastic EP Backup Port
+    SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
+    SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
+    SGLANG_NVFP4_ONLINE_SCALE = EnvBool(False)
+    SGLANG_NVFP4_PERTOKEN_SCALE = EnvBool(False)
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
 

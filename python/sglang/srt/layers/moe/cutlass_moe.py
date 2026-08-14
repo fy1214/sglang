@@ -495,3 +495,142 @@ def cutlass_moe_fp4(
     if not apply_router_weight_on_input:
         c2 = c2 * topk_weights.view(m_a, num_topk, 1).to(out_dtype)
     return c2.sum(dim=1).to(out_dtype)
+
+
+def cutlass_moe_fp4_pertoken(
+    a: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_blockscale_flat: torch.Tensor,
+    w1_weight_scale_2: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale_flat: torch.Tensor,
+    w2_weight_scale_2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    params: CutlassMoEParams,
+    w1_row_offsets: torch.Tensor,
+    w1_scale_offsets: torch.Tensor,
+    w2_row_offsets: torch.Tensor,
+    w2_scale_offsets: torch.Tensor,
+    apply_router_weight_on_input: bool = False,
+):
+    """MoE FP4 with per-token activation scale via sglang fp4_utils interface.
+
+    Activation is quantized per-token (each row gets its own global scale),
+    instead of per-expert-tensor. This yields better precision for tokens
+    with very different magnitude distributions across experts.
+
+    Weight format is the same as cutlass_moe_fp4 (NVFP4 checkpoint).
+    The key difference is in the GEMM kernel which fuses a per-row output
+    scale in its epilogue.
+    """
+    from sglang.srt.layers.quantization.fp4_utils import (
+        compute_act_scale_offsets,
+        compute_padded_expert_offsets,
+        get_prob_host,
+        nvfp4_grouped_gemm,
+        nvfp4_quantize_pertoken,
+    )
+
+    m_a, k_a = a.shape
+    num_topk = topk_ids.shape[1]
+    device = a.device
+    out_dtype = a.dtype
+
+    e_w1 = w1_fp4.shape[0]
+    n2_w1 = w1_fp4.shape[1]  # 2 * intermediate_size
+    n_w2 = w2_fp4.shape[1]   # hidden_size (output of GEMM2)
+
+    # --- Token routing (reuse sgl_kernel) ---
+    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    prepare_moe_input(
+        topk_ids,
+        params.expert_offsets,
+        params.problem_sizes1,
+        params.problem_sizes2,
+        a_map,
+        c_map,
+        params.num_experts,
+        params.intermediate_size_per_partition,
+        params.hidden_size,
+        params.blockscale_offsets,
+    )
+
+    total_expanded = m_a * num_topk
+    a_permuted = shuffle_rows(a, a_map, (total_expanded, k_a))
+
+    # --- GPU offset computation (no GPU→CPU sync) ---
+    padded_offsets = compute_padded_expert_offsets(params.expert_offsets)
+    act_scale_offsets_1 = compute_act_scale_offsets(padded_offsets, k_a)
+    total_padded = ((total_expanded + e_w1 * 127 + 127) // 128) * 128
+
+    # Per-token scale: map each row to its expert via searchsorted
+    row_indices = torch.arange(total_padded, device=device, dtype=padded_offsets.dtype)
+    expert_ids = torch.searchsorted(padded_offsets[1:], row_indices, right=True)
+    expert_ids = expert_ids.clamp(max=e_w1 - 1)
+
+    # --- GEMM1: fused pad + per-token quantize + grouped GEMM ---
+    data1, sf1, gs1 = nvfp4_quantize_pertoken(
+        a_permuted, padded_offsets, params.expert_offsets,
+        act_scale_offsets_1, total_padded, k_a,
+    )
+    pts1 = (gs1 * w1_weight_scale_2[expert_ids]).contiguous()
+
+    max_m = ((total_expanded + 127) // 128) * 128
+    prob_host_1 = get_prob_host(e_w1, max_m, n2_w1, k_a)
+    c1 = torch.empty(total_padded, n2_w1, dtype=out_dtype, device=device)
+    nvfp4_grouped_gemm(
+        c1,
+        data1, w1_fp4.reshape(-1, w1_fp4.shape[-1]),
+        sf1, w1_blockscale_flat,
+        padded_offsets, w1_row_offsets,
+        act_scale_offsets_1, w1_scale_offsets,
+        e_w1, pts1, prob_host_1,
+    )
+
+    # --- SwiGLU activation ---
+    intermediate = torch.empty(
+        (total_padded, n2_w1 // 2), device=device, dtype=out_dtype
+    )
+    silu_and_mul(c1, intermediate)
+    del c1
+
+    # --- GEMM2: per-token quantize (already padded) + grouped GEMM ---
+    inter_k = n2_w1 // 2
+    act_scale_offsets_2 = compute_act_scale_offsets(padded_offsets, inter_k)
+    data2, sf2, gs2 = nvfp4_quantize_pertoken(
+        intermediate, padded_offsets, padded_offsets,
+        act_scale_offsets_2, total_padded, inter_k,
+    )
+    del intermediate
+
+    pts2 = (gs2 * w2_weight_scale_2[expert_ids]).contiguous()
+
+    n2 = n_w2
+    prob_host_2 = get_prob_host(e_w1, max_m, n2, inter_k)
+    c2 = torch.empty(total_padded, n2, dtype=out_dtype, device=device)
+    nvfp4_grouped_gemm(
+        c2,
+        data2, w2_fp4.reshape(-1, w2_fp4.shape[-1]),
+        sf2, w2_blockscale_flat,
+        padded_offsets, w2_row_offsets,
+        act_scale_offsets_2, w2_scale_offsets,
+        e_w1, pts2, prob_host_2,
+    )
+
+    # --- Unpad via GPU gather (no sync) ---
+    out_indices = torch.arange(total_expanded, device=device, dtype=torch.int64)
+    expert_ids_out = torch.searchsorted(
+        params.expert_offsets[1:].to(torch.int64), out_indices, right=True,
+    ).clamp(max=e_w1 - 1)
+    local_pos = out_indices - params.expert_offsets[expert_ids_out].to(torch.int64)
+    gather_map = padded_offsets[expert_ids_out].to(torch.int64) + local_pos
+    c2 = c2[gather_map]
+
+    # --- Combine: shuffle back + weighted sum ---
+    c2 = shuffle_rows(c2, c_map, (total_expanded, params.hidden_size))
+    c2 = c2.view(m_a, num_topk, params.hidden_size)
+    if not apply_router_weight_on_input:
+        c2 = c2 * topk_weights.view(m_a, num_topk, 1).to(out_dtype)
+    return c2.sum(dim=1).to(out_dtype)
