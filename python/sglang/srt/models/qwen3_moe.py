@@ -22,6 +22,7 @@ import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -38,7 +39,6 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -225,6 +225,40 @@ def compute_yarn_parameters(
     return factor, low, high, attention_factor
 
 
+class Qwen3MoeGate(nn.Module):
+    """Qwen3 MoE router projection.
+
+    Production serving keeps bf16 ``F.linear``.  When deterministic inference
+    and ``--enable-fp32-moe-router`` are both set, logits come from
+    ``router_gemm_batch_invariant`` so Megatron's
+    ``MEGATRON_USE_SGLANG_ROUTER_GEMM`` wrap computes the same fp32 GEMM.
+    """
+
+    def __init__(self, config, prefix: str = ""):
+        super().__init__()
+        del prefix
+        self.weight = nn.Parameter(
+            torch.empty(
+                (config.num_experts, config.hidden_size),
+                dtype=torch.get_default_dtype(),
+            )
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        server_args = get_global_server_args()
+        if (
+            server_args.enable_deterministic_inference
+            and server_args.enable_fp32_moe_router
+        ):
+            from sglang.srt.batch_invariant_ops import router_gemm_batch_invariant
+
+            return router_gemm_batch_invariant(
+                hidden_states.contiguous(),
+                self.weight.contiguous(),
+            )
+        return F.linear(hidden_states, self.weight, None)
+
+
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -268,13 +302,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
         )
 
-        self.gate = ReplicatedLinear(
-            config.hidden_size,
-            config.num_experts,
-            bias=False,
-            quant_config=None,
-            prefix=add_prefix("gate", prefix),
-        )
+        self.gate = Qwen3MoeGate(config=config, prefix=add_prefix("gate", prefix))
 
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
@@ -322,7 +350,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
@@ -349,7 +377,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
+            router_logits = self.gate(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -371,7 +399,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):
             # router_logits: (num_tokens, n_experts)
-            state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
+            state.router_logits = self.gate(state.hidden_states_mlp_input)
         else:
             state.router_logits = None
 

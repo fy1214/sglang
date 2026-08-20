@@ -870,7 +870,6 @@ def _varlen_deep_gemm_silu_mul_quant(
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_8bit,
     )
@@ -939,19 +938,47 @@ def _varlen_deep_gemm_silu_mul_quant(
         assert (
             not swizzle
         ), "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
-        down_input_scale = torch.empty(
-            (E, N, G),
+        # Qwen3 moe_ffn=768 -> 6 scale groups: FAST_ACT v2 and JIT EP both
+        # refuse G%16/G%4. The fused Triton silu+quant fallback writes unpacked
+        # float32 (E, N, G) scales, which do not bit-match Megatron's
+        # silu_and_mul + sglang_per_token_group_quant_fp8 (packed UE8M0 TMA).
+        # Flatten to 2D, use those same kernels, then restack into masked layout.
+        from sgl_kernel import silu_and_mul
+
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            create_per_token_group_quant_fp8_output_scale,
+            sglang_per_token_group_quant_fp8,
+        )
+
+        ue8m0 = bool(deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0)
+        down_bf16 = torch.empty(
+            (E * N, D),
+            dtype=gateup_output.dtype,
             device=hidden_states_device,
-            dtype=torch.float32,
         )
-        silu_and_mul_masked_post_quant_fwd(
-            gateup_output,
-            down_input,
-            down_input_scale,
+        silu_and_mul(gateup_output.reshape(E * N, D * 2), down_bf16)
+        q, s = sglang_per_token_group_quant_fp8(
+            down_bf16,
             group_size,
-            masked_m,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            column_major_scales=ue8m0,
+            scale_tma_aligned=ue8m0,
+            scale_ue8m0=ue8m0,
         )
+        down_input = q.view(E, N, D)
+        if ue8m0:
+            down_input_scale = create_per_token_group_quant_fp8_output_scale(
+                x_shape=(E, N, D),
+                device=hidden_states_device,
+                group_size=group_size,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=True,
+            )
+            down_input_scale.copy_(
+                s.contiguous().view(E, N, down_input_scale.shape[-1])
+            )
+        else:
+            down_input_scale = s.reshape(E, N, G)
     return down_input, down_input_scale
 
 
