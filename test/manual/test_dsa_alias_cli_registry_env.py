@@ -29,6 +29,7 @@ class TestDSAChoicesAndFields(unittest.TestCase):
         self.assertIn("fa3", choices)
         self.assertIn("tilelang", choices)
         self.assertIn("flashinfer_sparse_mla", choices)
+        self.assertIn("flashinfer_mla_sparse", choices)
 
     def test_serverargs_has_dsa_fields(self):
         sa = self.ServerArgs

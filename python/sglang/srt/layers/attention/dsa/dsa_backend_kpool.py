@@ -44,10 +44,12 @@ class DeepseekSparseAttnBackendKPoolMixin:
             or dsa_impl in ("fa3", "tilelang", "trtllm")
         ):
             return
+        # flashinfer_mla_sparse: kpool>1 needs vLLM-style valid=topk+ctx%kpool
+        # clamp in plan; not wired yet — keep failing closed here.
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
             f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            "backend."
+            "backend (not flashinfer_mla_sparse / flashmla_sparse)."
         )
 
     def _resolve_kpool_tail_backend(

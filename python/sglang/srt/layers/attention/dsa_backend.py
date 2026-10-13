@@ -329,6 +329,8 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse_q8",
     "flashmla_kv",
     "flashinfer_sparse_mla",
+    # SM90 FlashInfer BatchMLA FA3 + page_size=1 topk (≠ SM120 flashinfer_sparse_mla)
+    "flashinfer_mla_sparse",
     "fa3",
     "tilelang",
     "triton",
@@ -574,7 +576,39 @@ class DeepseekSparseAttnBackend(
             decode_impl=self.dsa_decode_impl,
         )
 
-        if uses_flashinfer_sparse_mla:
+        uses_flashinfer_mla_sparse = (
+            self.dsa_prefill_impl == "flashinfer_mla_sparse"
+            or self.dsa_decode_impl == "flashinfer_mla_sparse"
+        )
+        self._flashinfer_mla_sparse_runner = None
+
+        if uses_flashinfer_mla_sparse:
+            if is_cuda() and self.device_sm_major != 9:
+                raise ValueError(
+                    "--dsa-*-backend flashinfer_mla_sparse is SM90 BatchMLA "
+                    f"FA3 sparse; got compute capability sm_{self.device_sm_major}x "
+                    "(use flashinfer_sparse_mla for SM120 packed sparse)."
+                )
+            self.workspace_buffer = get_buffer(
+                "dsa_flashinfer_mla_sparse_workspace",
+                lambda: torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                ),
+            )
+            from sglang.srt.layers.attention.dsa.flashinfer_mla_sparse import (
+                DSAFlashInferMLASparseRunner,
+            )
+
+            self._flashinfer_mla_sparse_runner = DSAFlashInferMLASparseRunner(
+                self.workspace_buffer,
+                num_heads=self.num_q_heads,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                backend="fa3",
+            )
+        elif uses_flashinfer_sparse_mla:
             self.workspace_buffer = get_buffer(
                 "dsa_flashinfer_sparse_mla_workspace",
                 lambda: torch.zeros(
@@ -2214,6 +2248,19 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             )
+        elif dsa_impl == "flashinfer_mla_sparse":
+            # BatchMLA page_size=1 topk path (paged KV), same table as fa3.
+            if topk_transform_method == TopkTransformMethod.RAGGED:
+                page_table_1 = topk_indices
+            return self._forward_flashinfer_mla_sparse(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2389,6 +2436,16 @@ class DeepseekSparseAttnBackend(
                 seq_lens=metadata.dsa_cache_seqlens_int32,
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            )
+        elif dsa_impl == "flashinfer_mla_sparse":
+            return self._forward_flashinfer_mla_sparse(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2923,6 +2980,48 @@ class DeepseekSparseAttnBackend(
             qk_rope_head_dim=self.qk_rope_head_dim,
             sm_scale=sm_scale,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        )
+
+    def _forward_flashinfer_mla_sparse(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: Optional[torch.Tensor],
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        """SM90 FlashInfer BatchMLA sparse: page_size=1 topk page table.
+
+        Same wrapper class as dense ``flashinfer_mla_backend``, wired for DSA
+        sparse like vLLM ``FLASHINFER_MLA_SPARSE_SM90``. Prefill and decode
+        share this path. ``index_kpool>1`` / EAGLE tail metadata are not
+        handled yet (see kpool gate).
+        """
+        runner = self._flashinfer_mla_sparse_runner
+        assert runner is not None, "flashinfer_mla_sparse runner was not initialized"
+
+        num_tokens = q_nope.shape[0]
+        q_nope = q_nope.view(num_tokens, -1, q_nope.shape[-1])
+        if q_rope is None:
+            # Absorbed concat layout already split upstream into q_nope/q_rope
+            # views; treat missing rope as NoPE.
+            q_pe = q_nope.new_empty(num_tokens, q_nope.shape[1], 0)
+        else:
+            q_pe = q_rope.view(num_tokens, -1, q_rope.shape[-1])
+
+        if self.dsa_index_kpool > 1:
+            page_table_1 = page_table_1.clamp(min=0)
+
+        return runner.forward(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            kv_cache=kv_cache,
+            page_table_1=page_table_1,
+            cache_seqlens=cache_seqlens,
+            sm_scale=sm_scale,
+            v_head_dim=v_head_dim,
         )
 
     def _forward_flashmla_kv(
