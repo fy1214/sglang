@@ -41,13 +41,16 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            # BatchMLA sparse accepts the same expanded topk page table as
+            # fa3/tilelang: kv_len = pooled_topk + ctx%kpool (see compute_dsa_seqlens).
+            or dsa_impl in ("fa3", "tilelang", "trtllm", "flashinfer_mla_sparse")
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            "backend."
+            f"currently only supported by the FA3/TileLang/TRTLLM/"
+            f"flashinfer_mla_sparse DSA {phase} backend "
+            "(not flashmla_sparse)."
         )
 
     def _resolve_kpool_tail_backend(

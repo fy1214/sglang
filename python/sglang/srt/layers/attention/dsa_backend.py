@@ -265,6 +265,8 @@ class DSAMetadata:
     dsa_extend_seq_lens_list: List[int]
     dsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
     dsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
+    # Host twin of dsa_cache_seqlens_int32 for BatchMLA plan (no per-step D2H).
+    dsa_cache_seqlens_cpu: Optional[torch.Tensor] = None
 
     flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
@@ -329,6 +331,8 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse_q8",
     "flashmla_kv",
     "flashinfer_sparse_mla",
+    # SM90 FlashInfer BatchMLA FA3 + page_size=1 topk (≠ SM120 flashinfer_sparse_mla)
+    "flashinfer_mla_sparse",
     "fa3",
     "tilelang",
     "triton",
@@ -574,7 +578,62 @@ class DeepseekSparseAttnBackend(
             decode_impl=self.dsa_decode_impl,
         )
 
-        if uses_flashinfer_sparse_mla:
+        uses_flashinfer_mla_sparse = (
+            self.dsa_prefill_impl == "flashinfer_mla_sparse"
+            or self.dsa_decode_impl == "flashinfer_mla_sparse"
+        )
+        self._flashinfer_mla_sparse_runner = None
+
+        if uses_flashinfer_mla_sparse:
+            if is_cuda() and self.device_sm_major != 9:
+                raise ValueError(
+                    "--dsa-*-backend flashinfer_mla_sparse is SM90 BatchMLA "
+                    f"FA3 sparse; got compute capability sm_{self.device_sm_major}x "
+                    "(use flashinfer_sparse_mla for SM120 packed sparse)."
+                )
+            self.workspace_buffer = get_buffer(
+                "dsa_flashinfer_mla_sparse_workspace",
+                lambda: torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                ),
+            )
+            from sglang.srt.layers.attention.dsa.flashinfer_mla_sparse import (
+                DSAFlashInferMLASparseRunner,
+            )
+            from sglang.srt.runtime_context import get_schedule
+
+            # Size for decode graph + chunked prefill; init_cuda_graph_state may grow
+            # once more, then freeze_capacity (no silent rebuild after capture).
+            # KPool appends up to (kpool-1) live tail slots beyond index_topk.
+            topk_width = int(self.dsa_index_topk or 1)
+            if self.dsa_index_kpool > 1:
+                topk_width += int(self.dsa_index_kpool) - 1
+            max_tokens = max(
+                int(get_schedule().max_prefill_tokens or 0),
+                model_runner.max_running_requests
+                * max(self.speculative_num_draft_tokens or 1, 1),
+                1,
+            )
+            self._flashinfer_mla_sparse_runner = DSAFlashInferMLASparseRunner(
+                self.workspace_buffer,
+                num_heads=self.num_q_heads,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                sm_scale=float(model_runner.model_config.scaling),
+                q_dtype=model_runner.dtype,
+                kv_dtype=(
+                    self.kv_cache_dtype
+                    if self.kv_cache_dtype
+                    in (torch.bfloat16, torch.float16, torch.float8_e4m3fn)
+                    else model_runner.dtype
+                ),
+                max_tokens=max_tokens,
+                topk_width=topk_width,
+                backend="fa3",
+            )
+        elif uses_flashinfer_sparse_mla:
             self.workspace_buffer = get_buffer(
                 "dsa_flashinfer_sparse_mla_workspace",
                 lambda: torch.zeros(
@@ -1129,6 +1188,21 @@ class DeepseekSparseAttnBackend(
         dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
             forward_batch, dsa_cache_seqlens_int32
         )
+        # Host twin for BatchMLA plan: decode uses seq_lens_cpu; other modes
+        # fall back to a one-shot .cpu() of the just-built device tensor (eager
+        # metadata is outside the decode replay hot path).
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.seq_lens_cpu is not None
+        ):
+            dsa_cache_seqlens_cpu = pad_dsa_cache_seqlens(
+                forward_batch,
+                self._host_dsa_cache_seqlens_cpu(
+                    forward_batch.seq_lens_cpu[:batch_size]
+                ),
+            )
+        else:
+            dsa_cache_seqlens_cpu = dsa_cache_seqlens_int32.detach().cpu()
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
 
@@ -1173,6 +1247,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
+            dsa_cache_seqlens_cpu=dsa_cache_seqlens_cpu,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
@@ -1193,6 +1268,7 @@ class DeepseekSparseAttnBackend(
             kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
+        self._plan_flashinfer_mla_sparse(metadata)
 
     def _cal_indexer_k_start_end(
         self,
@@ -1280,6 +1356,15 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        if self._flashinfer_mla_sparse_runner is not None:
+            topk_width = int(self.dsa_index_topk or 1)
+            if self.dsa_index_kpool > 1:
+                topk_width += int(self.dsa_index_kpool) - 1
+            self._flashinfer_mla_sparse_runner.ensure_capacity(
+                max_num_tokens, topk_width
+            )
+            # Capture will bind reserved buffer addresses; forbid later grow.
+            self._flashinfer_mla_sparse_runner.freeze_capacity()
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
@@ -1540,6 +1625,13 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        if seq_lens_cpu is not None:
+            dsa_cache_seqlens_cpu = self._host_dsa_cache_seqlens_cpu(
+                self._expand_seqlens_cpu_for_graph(seq_lens_cpu, forward_mode, bs)
+            )
+        else:
+            dsa_cache_seqlens_cpu = dsa_cache_seqlens_int32.detach().cpu()
+
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1552,6 +1644,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
+            dsa_cache_seqlens_cpu=dsa_cache_seqlens_cpu,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
@@ -1562,6 +1655,7 @@ class DeepseekSparseAttnBackend(
         metadata = self._init_kpool_metadata_capture(metadata, bs, forward_mode)
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
+        self._plan_flashinfer_mla_sparse(metadata)
 
     def _apply_cuda_graph_metadata(
         self,
@@ -1882,7 +1976,18 @@ class DeepseekSparseAttnBackend(
                 )
             )
 
+        # Refresh host twin from seq_lens_cpu (no D2H of device dsa_cache_seqlens).
+        if self._flashinfer_mla_sparse_runner is not None and seq_lens_cpu is not None:
+            object.__setattr__(
+                metadata,
+                "dsa_cache_seqlens_cpu",
+                self._host_dsa_cache_seqlens_cpu(
+                    self._expand_seqlens_cpu_for_graph(seq_lens_cpu, forward_mode, bs)
+                ),
+            )
+
         self.forward_metadata = metadata
+        self._plan_flashinfer_mla_sparse(metadata)
 
     def init_forward_metadata_replay_cuda_graph_from_precomputed(
         self,
@@ -1928,7 +2033,18 @@ class DeepseekSparseAttnBackend(
             metadata, precomputed, forward_mode
         )
 
+        # MTP precomputed path: host twin from the just-copied device buffer.
+        # Decode replay uses seq_lens_cpu instead (no D2H); this path is rarer.
+        # DSAMetadata is frozen — must use object.__setattr__.
+        if self._flashinfer_mla_sparse_runner is not None:
+            object.__setattr__(
+                metadata,
+                "dsa_cache_seqlens_cpu",
+                precomputed.dsa_cache_seqlens.detach().cpu(),
+            )
+
         self.forward_metadata = metadata
+        self._plan_flashinfer_mla_sparse(metadata)
 
     def forward_extend(
         self,
@@ -2214,6 +2330,19 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             )
+        elif dsa_impl == "flashinfer_mla_sparse":
+            # BatchMLA page_size=1 topk path (paged KV), same table as fa3.
+            if topk_transform_method == TopkTransformMethod.RAGGED:
+                page_table_1 = topk_indices
+            return self._forward_flashinfer_mla_sparse(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2389,6 +2518,16 @@ class DeepseekSparseAttnBackend(
                 seq_lens=metadata.dsa_cache_seqlens_int32,
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            )
+        elif dsa_impl == "flashinfer_mla_sparse":
+            return self._forward_flashinfer_mla_sparse(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2924,6 +3063,128 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
+
+    def _host_dsa_cache_seqlens_cpu(self, seqlens_cpu: torch.Tensor) -> torch.Tensor:
+        """CPU ``compute_dsa_seqlens`` for BatchMLA plan (no device sync)."""
+        return compute_dsa_seqlens(
+            seqlens_cpu.to(dtype=torch.int32),
+            dsa_index_topk=self.dsa_index_topk,
+            index_kpool=self.dsa_index_kpool,
+        )
+
+    def _expand_seqlens_cpu_for_graph(
+        self,
+        seq_lens_cpu: torch.Tensor,
+        forward_mode: ForwardMode,
+        bs: int,
+    ) -> torch.Tensor:
+        """Host expand of per-req seq lens to per-query-row lengths (graph modes)."""
+        if forward_mode.is_decode_or_idle():
+            return seq_lens_cpu[:bs].to(dtype=torch.int32)
+        draft_n = int(self.speculative_num_draft_tokens or 1)
+        # Mirror capture/replay: kv_len = prefix+draft, each row j attends
+        # kv_len - draft_n + j + 1 ... up to kv_len (draft_n rows per req).
+        parts: List[torch.Tensor] = []
+        for kv_len in (seq_lens_cpu[:bs].to(dtype=torch.int32) + draft_n).tolist():
+            start = int(kv_len) - draft_n + 1
+            parts.append(torch.arange(start, int(kv_len) + 1, dtype=torch.int32))
+        if not parts:
+            return torch.zeros(0, dtype=torch.int32)
+        return torch.cat(parts)
+
+    def _plan_flashinfer_mla_sparse(self, metadata: DSAMetadata) -> None:
+        """Plan BatchMLA sparse outside CUDA-graph capture (vLLM-style).
+
+        Prefers ``dsa_cache_seqlens_cpu`` so plan() never does per-step D2H of
+        the device seqlens buffer. Indices are packed later in forward.
+        """
+        runner = self._flashinfer_mla_sparse_runner
+        if runner is None:
+            return
+        device_lens = metadata.dsa_cache_seqlens_int32
+        if device_lens is None:
+            return
+        num_tokens = int(device_lens.shape[0])
+        if num_tokens == 0:
+            return
+        kv_lens_cpu = metadata.dsa_cache_seqlens_cpu
+        if kv_lens_cpu is None:
+            # Escape hatch for paths not yet wired with a host twin (rare).
+            kv_lens_cpu = device_lens.detach().cpu()
+        else:
+            kv_lens_cpu = kv_lens_cpu[:num_tokens]
+            if kv_lens_cpu.shape[0] != num_tokens:
+                raise RuntimeError(
+                    "flashinfer_mla_sparse dsa_cache_seqlens_cpu length "
+                    f"{kv_lens_cpu.shape[0]} != device {num_tokens}"
+                )
+        runner.ensure_capacity(num_tokens, runner.topk_width)
+        runner.plan(num_tokens, kv_lens_cpu)
+
+    def _forward_flashinfer_mla_sparse(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: Optional[torch.Tensor],
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        """SM90 FlashInfer BatchMLA sparse: pack+run (plan is metadata-time).
+
+        Same wrapper as dense ``flashinfer_mla_backend``, DSA topk page_table
+        like vLLM ``FLASHINFER_MLA_SPARSE_SM90``. Supports kpool tails via wider
+        page table + ``compute_dsa_seqlens`` (GLM NoPE: ``q_rope`` may be empty).
+        """
+        runner = self._flashinfer_mla_sparse_runner
+        assert runner is not None, "flashinfer_mla_sparse runner was not initialized"
+
+        num_tokens = q_nope.shape[0]
+        q_nope = q_nope.view(num_tokens, -1, q_nope.shape[-1])
+        # GLM-style NoPE: q_rope can be a 0-width tensor (numel==0). ``view`` with
+        # -1 and last dim 0 is ambiguous — synthesize an explicit empty pe.
+        if q_rope is None or q_rope.shape[-1] == 0:
+            q_pe = q_nope.new_empty(num_tokens, q_nope.shape[1], 0)
+        else:
+            q_pe = q_rope.view(num_tokens, -1, q_rope.shape[-1])
+
+        if page_table_1.shape[0] != num_tokens:
+            raise ValueError(
+                f"page_table rows {page_table_1.shape[0]} != q tokens {num_tokens}"
+            )
+        if cache_seqlens.shape[0] != num_tokens:
+            cache_seqlens = cache_seqlens[:num_tokens]
+
+        # Plan must come from metadata (same live query-row count as forward).
+        # Do not silently re-plan on every prefill size change — that regresses
+        # to per-step plan. Only bootstrap when metadata never planned.
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if runner._planned_num_tokens < 0:
+            if capturing:
+                raise RuntimeError(
+                    "flashinfer_mla_sparse missing metadata-time plan before "
+                    f"CUDA-graph forward (num_tokens={num_tokens})"
+                )
+            runner.ensure_capacity(num_tokens, page_table_1.shape[1])
+            runner.plan(num_tokens, cache_seqlens.detach().cpu())
+        elif runner._planned_num_tokens != num_tokens:
+            raise RuntimeError(
+                "flashinfer_mla_sparse plan/forward num_tokens mismatch: "
+                f"planned={runner._planned_num_tokens} forward={num_tokens}. "
+                "Metadata-time plan must use the live query row count."
+            )
+
+        if self.dsa_index_kpool > 1:
+            page_table_1 = page_table_1.clamp(min=0)
+
+        # sm_scale is baked at metadata-time plan() from model_config.scaling.
+        _ = sm_scale
+
+        runner.pack_indices(page_table_1)
+        return runner.run(q_nope, q_pe, kv_cache, v_head_dim)
 
     def _forward_flashmla_kv(
         self,
