@@ -591,6 +591,16 @@ class DeepseekSparseAttnBackend(
                     f"FA3 sparse; got compute capability sm_{self.device_sm_major}x "
                     "(use flashinfer_sparse_mla for SM120 packed sparse)."
                 )
+            # vLLM SM90 FP8 path needs plain E4M3 rows; packed DSA FP8 embeds
+            # per-block scales (528/656) and cannot feed BatchMLA FA3.
+            if self.dsa_kv_cache_store_fp8:
+                raise ValueError(
+                    "flashinfer_mla_sparse does not support packed DSA FP8 KV "
+                    "(override_kv_cache_dim with per-block scales). Select "
+                    "--dsa-prefill/decode-backend flashinfer_mla_sparse before "
+                    "KV pool allocation so calculate_mla_kv_cache_dim keeps the "
+                    "raw MLA dim (same as TRTLLM / vLLM FLASHINFER_MLA_SPARSE_SM90)."
+                )
             self.workspace_buffer = get_buffer(
                 "dsa_flashinfer_mla_sparse_workspace",
                 lambda: torch.empty(
@@ -601,6 +611,7 @@ class DeepseekSparseAttnBackend(
             )
             from sglang.srt.layers.attention.dsa.flashinfer_mla_sparse import (
                 DSAFlashInferMLASparseRunner,
+                normalize_batch_mla_kv_dtype,
             )
             from sglang.srt.runtime_context import get_schedule
 
@@ -616,6 +627,18 @@ class DeepseekSparseAttnBackend(
                 * max(self.speculative_num_draft_tokens or 1, 1),
                 1,
             )
+            # plan() needs logical E4M3 (not uint8 storage); see vLLM #55222.
+            plan_kv_dtype = normalize_batch_mla_kv_dtype(
+                self.kv_cache_dtype
+                if self.kv_cache_dtype
+                in (
+                    torch.bfloat16,
+                    torch.float16,
+                    torch.float8_e4m3fn,
+                    torch.uint8,
+                )
+                else model_runner.dtype
+            )
             self._flashinfer_mla_sparse_runner = DSAFlashInferMLASparseRunner(
                 self.workspace_buffer,
                 num_heads=self.num_q_heads,
@@ -623,12 +646,7 @@ class DeepseekSparseAttnBackend(
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 sm_scale=float(model_runner.model_config.scaling),
                 q_dtype=model_runner.dtype,
-                kv_dtype=(
-                    self.kv_cache_dtype
-                    if self.kv_cache_dtype
-                    in (torch.bfloat16, torch.float16, torch.float8_e4m3fn)
-                    else model_runner.dtype
-                ),
+                kv_dtype=plan_kv_dtype,
                 max_tokens=max_tokens,
                 topk_width=topk_width,
                 backend="fa3",
@@ -2342,6 +2360,7 @@ class DeepseekSparseAttnBackend(
                 cache_seqlens=metadata.dsa_cache_seqlens_int32,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                layer=layer,
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2528,6 +2547,7 @@ class DeepseekSparseAttnBackend(
                 cache_seqlens=metadata.dsa_cache_seqlens_int32,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                layer=layer,
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -3130,12 +3150,14 @@ class DeepseekSparseAttnBackend(
         cache_seqlens: torch.Tensor,
         sm_scale: float,
         v_head_dim: int,
+        layer=None,
     ) -> torch.Tensor:
         """SM90 FlashInfer BatchMLA sparse: pack+run (plan is metadata-time).
 
         Same wrapper as dense ``flashinfer_mla_backend``, DSA topk page_table
         like vLLM ``FLASHINFER_MLA_SPARSE_SM90``. Supports kpool tails via wider
         page table + ``compute_dsa_seqlens`` (GLM NoPE: ``q_rope`` may be empty).
+        FP8 KV: raw E4M3 + ``layer.k_scale_float`` as ``ckv_scale`` (kpe_scale=1).
         """
         runner = self._flashinfer_mla_sparse_runner
         assert runner is not None, "flashinfer_mla_sparse runner was not initialized"
@@ -3184,7 +3206,17 @@ class DeepseekSparseAttnBackend(
         _ = sm_scale
 
         runner.pack_indices(page_table_1)
-        return runner.run(q_nope, q_pe, kv_cache, v_head_dim)
+        ckv_scale = None
+        if runner.use_fp8_kv_cache and layer is not None:
+            ckv_scale = float(getattr(layer, "k_scale_float", None) or 1.0)
+        return runner.run(
+            q_nope,
+            q_pe,
+            kv_cache,
+            v_head_dim,
+            ckv_scale=ckv_scale,
+            kpe_scale=1.0 if runner.use_fp8_kv_cache else None,
+        )
 
     def _forward_flashmla_kv(
         self,

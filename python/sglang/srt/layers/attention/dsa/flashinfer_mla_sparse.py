@@ -5,6 +5,9 @@ Mirrors vLLM ``FLASHINFER_MLA_SPARSE_SM90``:
 - ``page_size=1`` top-k slots are the page table; ``causal=False``
 - ``plan()`` runs outside CUDA-graph capture (metadata build / replay)
 - ``pack_indices()`` + ``run()`` are capture-safe and update reserved buffers
+- FP8 KV: plain contiguous E4M3 (uint8 storage / float8 view) + per-tensor
+  ``ckv_scale`` / ``kpe_scale`` (same as vLLM ``forward_mqa``); not the packed
+  DSA 528/656B scaled layout
 - Distinct from SM120 ``flashinfer_sparse_mla``
 """
 
@@ -23,6 +26,18 @@ except ImportError:  # pragma: no cover
     triton = None  # type: ignore[assignment]
     tl = None  # type: ignore[assignment]
     _TRITON_AVAILABLE = False
+
+_FP8_KV_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+
+def normalize_batch_mla_kv_dtype(kv_dtype: torch.dtype) -> torch.dtype:
+    """FlashInfer plan rejects ``uint8``; map storage dtype to logical E4M3.
+
+    Same fix as vLLM #55222 for ``FLASHINFER_MLA_SPARSE_SM90``.
+    """
+    if kv_dtype == torch.uint8:
+        return torch.float8_e4m3fn
+    return kv_dtype
 
 
 def pack_topk_page_table_to_csr(
@@ -103,7 +118,9 @@ class DSAFlashInferMLASparseRunner:
         self.qk_rope_head_dim = qk_rope_head_dim
         self.sm_scale = sm_scale
         self.q_dtype = q_dtype
-        self.kv_dtype = kv_dtype
+        # plan()/run() need logical E4M3; pool may store uint8 (vLLM #55222).
+        self.kv_dtype = normalize_batch_mla_kv_dtype(kv_dtype)
+        self.use_fp8_kv_cache = self.kv_dtype in _FP8_KV_DTYPES
         self.backend = backend
         self.max_tokens = max_tokens
         self.topk_width = topk_width
@@ -276,8 +293,15 @@ class DSAFlashInferMLASparseRunner:
         v_head_dim: int,
         *,
         out: Optional[torch.Tensor] = None,
+        ckv_scale: Optional[float] = None,
+        kpe_scale: Optional[float] = None,
     ) -> torch.Tensor:
-        """Run BatchMLA using the planned reserved buffers (no plan here)."""
+        """Run BatchMLA using the planned reserved buffers (no plan here).
+
+        FP8 KV mirrors vLLM ``FlashInferMLASparseSM90Impl.forward_mqa``:
+        view storage as ``float8_e4m3fn`` and pass per-tensor scales into
+        FA3 in-kernel dequant (Q stays BF16).
+        """
         if self._planned_num_tokens < 0:
             raise RuntimeError("flashinfer_mla_sparse run() called before plan()")
 
@@ -286,6 +310,29 @@ class DSAFlashInferMLASparseRunner:
             flat = kv_cache.unsqueeze(1)
         else:
             flat = kv_cache
+
+        if self.use_fp8_kv_cache or flat.dtype in (
+            torch.uint8,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ):
+            if flat.dtype == torch.uint8:
+                flat = flat.view(torch.float8_e4m3fn)
+            elif flat.dtype not in _FP8_KV_DTYPES:
+                raise TypeError(
+                    "flashinfer_mla_sparse FP8 path expected uint8/float8_e4m3 "
+                    f"KV cache, got dtype={flat.dtype}"
+                )
+            expected_dim = self.kv_lora_rank + self.qk_rope_head_dim
+            if flat.shape[-1] != expected_dim:
+                raise ValueError(
+                    "flashinfer_mla_sparse FP8 requires raw MLA KV layout "
+                    f"(last dim={expected_dim}=kv_lora+rope); got "
+                    f"last dim={flat.shape[-1]}. Packed DSA FP8 (528/656) is "
+                    "unsupported — select flashinfer_mla_sparse before pool "
+                    "alloc so calculate_mla_kv_cache_dim returns the raw dim."
+                )
+
         ckv = flat[..., :v_head_dim]
         kpe = flat[..., v_head_dim:]
         if self.qk_rope_head_dim == 0:
@@ -295,4 +342,11 @@ class DSAFlashInferMLASparseRunner:
 
         if out is None:
             out = q_nope.new_empty(q_nope.shape)
-        return self.wrapper.run(q_nope, q_pe, ckv, kpe, out=out)
+
+        scale_kwargs = {}
+        if self.use_fp8_kv_cache or ckv.dtype in _FP8_KV_DTYPES:
+            scale_kwargs = {
+                "ckv_scale": float(1.0 if ckv_scale is None else ckv_scale),
+                "kpe_scale": float(1.0 if kpe_scale is None else kpe_scale),
+            }
+        return self.wrapper.run(q_nope, q_pe, ckv, kpe, out=out, **scale_kwargs)
