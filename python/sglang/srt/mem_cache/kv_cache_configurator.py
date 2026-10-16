@@ -2582,21 +2582,27 @@ def calculate_mla_kv_cache_dim(
     if not is_dsa_model:
         return kv_cache_dim
 
-    # TRTLLM uses the raw MLA KV layout. In disaggregated serving only the
-    # backend for the local role determines the local pool layout; the
-    # inactive role may legitimately have a different default backend.
+    # Backends that consume contiguous raw MLA KV (no packed per-block scales).
+    # Mirrors vLLM FLASHINFER_MLA_SPARSE_SM90 plain E4M3 ``[N, 1, 512/576]``.
+    # In disaggregated serving only the backend for the local role determines
+    # the local pool layout; the inactive role may differ.
+    _RAW_MLA_FP8_BACKENDS = ("trtllm", "flashinfer_mla_sparse")
     disaggregation_mode = get_disagg().disaggregation_mode
     if disaggregation_mode == "decode":
-        uses_trtllm_kv_layout = get_exec().kernel.dsa_decode_backend == "trtllm"
+        uses_raw_mla_kv_layout = (
+            get_exec().kernel.dsa_decode_backend in _RAW_MLA_FP8_BACKENDS
+        )
     elif disaggregation_mode == "prefill":
-        uses_trtllm_kv_layout = get_exec().kernel.dsa_prefill_backend == "trtllm"
+        uses_raw_mla_kv_layout = (
+            get_exec().kernel.dsa_prefill_backend in _RAW_MLA_FP8_BACKENDS
+        )
     else:
-        uses_trtllm_kv_layout = (
-            get_exec().kernel.dsa_prefill_backend == "trtllm"
-            or get_exec().kernel.dsa_decode_backend == "trtllm"
+        uses_raw_mla_kv_layout = (
+            get_exec().kernel.dsa_prefill_backend in _RAW_MLA_FP8_BACKENDS
+            or get_exec().kernel.dsa_decode_backend in _RAW_MLA_FP8_BACKENDS
         )
 
-    if uses_trtllm_kv_layout:
+    if uses_raw_mla_kv_layout:
         return kv_cache_dim
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
@@ -2610,7 +2616,7 @@ def calculate_mla_kv_cache_dim(
     quant_block_size = DSATokenToKVPool.quant_block_size
     rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
-    # (excluding TRTLLM and HIP raw-layout kernels).
+    # (excluding TRTLLM / flashinfer_mla_sparse and HIP raw-layout kernels).
     # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
     # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
     if kv_cache_dtype == torch.float8_e4m3fn:

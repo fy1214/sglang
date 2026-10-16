@@ -74,5 +74,67 @@ class TestCliChoiceRegistered(unittest.TestCase):
         self.assertEqual(args.dsa_decode_backend, "flashinfer_mla_sparse")
 
 
+class TestFp8KvPlanDtype(unittest.TestCase):
+    def test_normalize_uint8_to_e4m3(self):
+        from sglang.srt.layers.attention.dsa.flashinfer_mla_sparse import (
+            normalize_batch_mla_kv_dtype,
+        )
+
+        self.assertEqual(normalize_batch_mla_kv_dtype(torch.uint8), torch.float8_e4m3fn)
+        self.assertEqual(
+            normalize_batch_mla_kv_dtype(torch.float8_e4m3fn), torch.float8_e4m3fn
+        )
+        self.assertEqual(normalize_batch_mla_kv_dtype(torch.bfloat16), torch.bfloat16)
+
+
+class TestFp8KvRunScales(unittest.TestCase):
+    def test_run_views_uint8_and_passes_scales(self):
+        """Mirror vLLM forward_mqa: view(e4m3) + ckv_scale/kpe_scale kwargs."""
+        from sglang.srt.layers.attention.dsa import flashinfer_mla_sparse as mod
+
+        class _FakeWrapper:
+            def __init__(self):
+                self.kwargs = None
+                self.ckv_dtype = None
+
+            def run(self, q_nope, q_pe, ckv, kpe, out=None, **kwargs):
+                self.kwargs = kwargs
+                self.ckv_dtype = ckv.dtype
+                return out if out is not None else q_nope
+
+        runner = object.__new__(mod.DSAFlashInferMLASparseRunner)
+        runner._planned_num_tokens = 1
+        runner.use_fp8_kv_cache = True
+        runner.kv_lora_rank = 512
+        runner.qk_rope_head_dim = 0
+        runner.wrapper = _FakeWrapper()
+
+        q = torch.zeros(1, 2, 512, dtype=torch.bfloat16)
+        q_pe = torch.zeros(1, 2, 0, dtype=torch.bfloat16)
+        kv = torch.zeros(4, 1, 512, dtype=torch.uint8)
+        out = runner.run(q, q_pe, kv, 512, ckv_scale=0.5, kpe_scale=1.0)
+        self.assertEqual(out.shape, q.shape)
+        self.assertEqual(runner.wrapper.ckv_dtype, torch.float8_e4m3fn)
+        self.assertEqual(runner.wrapper.kwargs, {"ckv_scale": 0.5, "kpe_scale": 1.0})
+
+    def test_run_rejects_packed_fp8_dim(self):
+        from sglang.srt.layers.attention.dsa import flashinfer_mla_sparse as mod
+
+        runner = object.__new__(mod.DSAFlashInferMLASparseRunner)
+        runner._planned_num_tokens = 1
+        runner.use_fp8_kv_cache = True
+        runner.kv_lora_rank = 512
+        runner.qk_rope_head_dim = 0
+        runner.wrapper = None
+
+        q = torch.zeros(1, 2, 512, dtype=torch.bfloat16)
+        q_pe = torch.zeros(1, 2, 0, dtype=torch.bfloat16)
+        # Packed DSA NoPE FP8: 512 + 4*4 scale bytes = 528
+        kv = torch.zeros(4, 1, 528, dtype=torch.uint8)
+        with self.assertRaises(ValueError) as ctx:
+            runner.run(q, q_pe, kv, 512, ckv_scale=1.0, kpe_scale=1.0)
+        self.assertIn("raw MLA KV layout", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
