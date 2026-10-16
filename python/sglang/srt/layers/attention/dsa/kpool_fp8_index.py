@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
@@ -450,6 +451,158 @@ def expand_pooled_groups_to_topk(
     return torch.where(valid, output, torch.full_like(output, -1))
 
 
+@triton.jit
+def _expand_pools_and_append_tail_kernel(
+    pool_ids_ptr,
+    seq_lens_ptr,
+    out_ptr,
+    topk,
+    out_cols,
+    POOL_SIZE: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+    pid_s0,
+    out_s0,
+):
+    # Port of vLLM expand_pools_and_append_tail (identity path).
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    cols = tile * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
+    mask = cols < out_cols
+
+    seq_len = tl.load(seq_lens_ptr + row)
+    pool_len = seq_len // POOL_SIZE
+    tail_start = pool_len * POOL_SIZE
+    tail_count = seq_len - tail_start
+
+    is_history = cols < topk
+    g = cols // POOL_SIZE
+    o = cols % POOL_SIZE
+    pid = tl.load(pool_ids_ptr + row * pid_s0 + g, mask=mask & is_history, other=-1)
+    hist_val = (pid * POOL_SIZE + o).to(tl.int32)
+    hist_out = tl.where(pid >= 0, hist_val, -1)
+
+    tail_off = cols - topk
+    is_tail = (tail_off >= 0) & (tail_off < tail_count)
+    tail_val = (tail_start + tail_off).to(tl.int32)
+    tail_out = tl.where(is_tail, tail_val, -1)
+
+    result = tl.where(is_history, hist_out, tail_out)
+    tl.store(out_ptr + row * out_s0 + cols, result, mask=mask)
+
+
+def expand_pools_and_append_tail(
+    pool_ids: torch.Tensor,
+    seq_lens: torch.Tensor,
+    pool_size: int,
+) -> torch.Tensor:
+    """Fuse expand + append-tail (logical token ids). Ported from vLLM kpool_compress."""
+    rows, n_groups = pool_ids.shape
+    topk = n_groups * pool_size
+    out_cols = topk + pool_size - 1
+    out = torch.empty((rows, out_cols), dtype=torch.int32, device=pool_ids.device)
+    block_cols = 128
+    n_tiles = triton.cdiv(out_cols, block_cols)
+    _expand_pools_and_append_tail_kernel[(rows, n_tiles)](
+        pool_ids,
+        seq_lens,
+        out,
+        topk,
+        out_cols,
+        POOL_SIZE=pool_size,
+        BLOCK_COLS=block_cols,
+        pid_s0=pool_ids.stride(0),
+        out_s0=out.stride(0),
+    )
+    return out
+
+
+@triton.jit
+def _sparse_mla_index_remap_kernel(
+    req_id_ptr,
+    block_table_ptr,
+    token_indices_ptr,
+    out_ptr,
+    max_num_blocks_per_req,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    bt_stride0,
+    bt_stride1,
+    ti_stride0,
+    ti_stride1,
+    out_stride0,
+    out_stride1,
+):
+    # Port of vLLM sparse_mla_index_remap (no DCP / prefill-workspace).
+    token_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+    indice_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    req = tl.load(req_id_ptr + token_id)
+    ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
+    tok = tl.load(ti_ptr, mask=indice_id < NUM_TOPK_TOKENS, other=-1)
+
+    is_invalid = tok < 0
+    block_id = tok // BLOCK_SIZE
+    inblock_off = tok % BLOCK_SIZE
+    valid_block = (block_id < max_num_blocks_per_req) & (block_id >= 0)
+    is_invalid |= ~valid_block
+    bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
+    base = tl.load(bt_ptr, mask=valid_block, other=0)
+    out_val = base * BLOCK_SIZE + inblock_off
+    out_val = tl.where(is_invalid, -1, out_val)
+
+    out_ptr_ij = out_ptr + token_id * out_stride0 + indice_id * out_stride1
+    tl.store(out_ptr_ij, out_val, mask=indice_id < NUM_TOPK_TOKENS)
+
+
+def sparse_mla_index_remap(
+    token_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    req_id: torch.Tensor | None = None,
+    block_size: int = 1,
+) -> torch.Tensor:
+    """Map logical token indices through ``block_table`` (vLLM index_remap).
+
+    ``out[b, i] = block_table[req, tok // block_size] * block_size + tok % block_size``,
+    with ``-1`` preserved. Default ``block_size=1`` matches SGLang ``page_table_1``.
+    """
+    assert token_indices.dtype == torch.int32 and block_table.dtype == torch.int32
+    num_tokens, num_topk = token_indices.shape
+    if req_id is None:
+        req_id = torch.arange(
+            num_tokens, dtype=torch.int32, device=token_indices.device
+        )
+    else:
+        req_id = req_id.to(dtype=torch.int32, device=token_indices.device)
+        assert req_id.shape[0] == num_tokens
+
+    out = torch.empty_like(token_indices)
+    # GLM kpool width is topk + pool_size - 1 (e.g. 2051); cover in one tile when
+    # modest, matching vLLM _remap_tiling's single-tile preference.
+    padded = triton.next_power_of_2(num_topk)
+    tile_n = padded if padded <= 4096 else 128
+    tiles = triton.cdiv(num_topk, tile_n)
+    _sparse_mla_index_remap_kernel[(num_tokens, tiles)](
+        req_id.contiguous(),
+        block_table.contiguous(),
+        token_indices.contiguous(),
+        out,
+        block_table.shape[1],
+        BLOCK_SIZE=block_size,
+        BLOCK_N=tile_n,
+        NUM_TOPK_TOKENS=num_topk,
+        bt_stride0=block_table.stride(0),
+        bt_stride1=block_table.stride(1),
+        ti_stride0=token_indices.stride(0),
+        ti_stride1=token_indices.stride(1),
+        out_stride0=out.stride(0),
+        out_stride1=out.stride(1),
+    )
+    return out
+
+
 def append_kpool_tail_to_topk(
     topk_result: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -582,6 +735,84 @@ def _append_kpool_tail_to_topk_kernel(
     tl.store(out_ptr + row * out_stride_0 + cols * out_stride_1, value, mask=mask)
 
 
+def _topk_from_pooled_history_logits_vllm(
+    logits: torch.Tensor,
+    group_lengths: torch.Tensor,
+    pool_size: int,
+    topk: int,
+    group_topk: int,
+    *,
+    page_table: torch.Tensor | None,
+    topk_offsets: torch.Tensor | None,
+    seq_lens: torch.Tensor | None,
+    row_starts: torch.Tensor | None,
+    page_table_row_index: torch.Tensor | None,
+) -> torch.Tensor:
+    """vLLM-style select+expand+remap: topKPerRow → expand → index_remap."""
+    from sglang.kernels.ops.attention.dsa.topk_per_row import top_k_per_row_select
+
+    group_lengths = group_lengths.to(torch.int32)
+    selected_groups = top_k_per_row_select(
+        logits,
+        group_lengths,
+        group_topk,
+        row_starts=row_starts,
+        next_n=1,
+    )
+
+    # Identity expand (+tail): logical token ids, matching vLLM kpool.
+    if seq_lens is not None and page_table is None and topk_offsets is None:
+        logical = expand_pools_and_append_tail(
+            selected_groups.contiguous(),
+            seq_lens.to(torch.int32),
+            pool_size,
+        )
+    else:
+        rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
+        max_valid_groups = min(logits.shape[1], group_topk)
+        valid_counts = torch.minimum(
+            group_lengths,
+            torch.full_like(group_lengths, max_valid_groups),
+        )
+        group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
+        # Expand to logical tokens first (no page_table / offsets).
+        logical = expand_pooled_groups_to_topk(
+            selected_groups.contiguous(),
+            group_valid,
+            topk=topk,
+            pool_size=pool_size,
+            page_table=None,
+            topk_offsets=None,
+        )
+        if seq_lens is not None:
+            logical = append_kpool_tail_to_topk(
+                logical,
+                seq_lens=seq_lens,
+                pool_lens=group_lengths,
+                pool_size=pool_size,
+                page_table=None,
+                topk_offsets=None,
+            )
+
+    if page_table is not None:
+        # vLLM sparse_mla_index_remap: logical token → physical page slot.
+        # SGLang kpool page_table_1 / req_to_token are page_size=1 tables.
+        return sparse_mla_index_remap(
+            logical,
+            page_table,
+            req_id=page_table_row_index,
+            block_size=1,
+        )
+
+    if topk_offsets is not None:
+        if topk_offsets.ndim == 2:
+            topk_offsets = topk_offsets.squeeze(1)
+        offsets = topk_offsets.to(torch.int32).unsqueeze(1)
+        return torch.where(logical >= 0, logical + offsets, logical)
+
+    return logical
+
+
 def topk_from_pooled_history_logits(
     logits: torch.Tensor,
     group_lengths: torch.Tensor,
@@ -602,7 +833,6 @@ def topk_from_pooled_history_logits(
     assert out_rows is None or out_rows >= logits.shape[0]
     assert page_table_row_index is None or page_table is not None
 
-    _, cols = logits.shape
     group_topk = history_group_budget_for_topk(topk, pool_size)
     if topk_offsets is not None and topk_offsets.ndim == 2:
         assert topk_offsets.shape[1] == 1
@@ -620,7 +850,25 @@ def topk_from_pooled_history_logits(
             f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
         )
 
-    if group_topk in (128, 160, 192, 224, 256, 512):
+    # Default: vLLM topKPerRow + expand + index_remap (no 4096 fused stash).
+    # Gate reuses SGLANG_OPT_USE_TOPK_V2 (default True) until a dedicated env lands.
+    use_vllm = (
+        envs.SGLANG_OPT_USE_TOPK_V2.get() and logits.stride(1) == 1 and pool_size > 1
+    )
+    if use_vllm:
+        result = _topk_from_pooled_history_logits_vllm(
+            logits=logits,
+            group_lengths=group_lengths,
+            pool_size=pool_size,
+            topk=topk,
+            group_topk=group_topk,
+            page_table=page_table,
+            topk_offsets=topk_offsets,
+            seq_lens=seq_lens.to(torch.int32) if seq_lens is not None else None,
+            row_starts=row_starts,
+            page_table_row_index=page_table_row_index,
+        )
+    elif group_topk in (128, 160, 192, 224, 256, 512):
         from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
             fast_kpool_topk_transform_fused,
         )
@@ -636,53 +884,45 @@ def topk_from_pooled_history_logits(
             seq_lens=seq_lens.to(torch.int32) if seq_lens is not None else None,
             page_table_row_index=page_table_row_index,
         )
-        if out_rows is None or out_rows == result.shape[0]:
-            return result
-        padded = torch.full(
-            (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
-        )
-        padded[: result.shape[0]] = result
-        return padded
-
-    assert page_table_row_index is None, (
-        "page_table_row_index requires the fused fast_kpool group_topk path"
-    )
-
-    from sgl_kernel import fast_topk_v2
-
-    selected_groups = fast_topk_v2(
-        logits,
-        group_lengths.to(torch.int32),
-        group_topk,
-        row_starts=row_starts,
-    )
-
-    rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
-    max_valid_groups = min(cols, group_topk)
-    valid_counts = torch.minimum(
-        group_lengths.to(torch.int32),
-        torch.full_like(group_lengths.to(torch.int32), max_valid_groups),
-    )
-    group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
-    expanded = expand_pooled_groups_to_topk(
-        selected_groups.contiguous(),
-        group_valid,
-        topk=topk,
-        pool_size=pool_size,
-        page_table=page_table,
-        topk_offsets=topk_offsets,
-    )
-    if seq_lens is None:
-        result = expanded
     else:
-        result = append_kpool_tail_to_topk(
-            expanded,
-            seq_lens=seq_lens,
-            pool_lens=group_lengths,
+        assert page_table_row_index is None, (
+            "page_table_row_index requires the fused or vLLM kpool path"
+        )
+        from sgl_kernel import fast_topk_v2
+
+        selected_groups = fast_topk_v2(
+            logits,
+            group_lengths.to(torch.int32),
+            group_topk,
+            row_starts=row_starts,
+        )
+        rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
+        max_valid_groups = min(logits.shape[1], group_topk)
+        valid_counts = torch.minimum(
+            group_lengths.to(torch.int32),
+            torch.full_like(group_lengths.to(torch.int32), max_valid_groups),
+        )
+        group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
+        expanded = expand_pooled_groups_to_topk(
+            selected_groups.contiguous(),
+            group_valid,
+            topk=topk,
             pool_size=pool_size,
             page_table=page_table,
             topk_offsets=topk_offsets,
         )
+        if seq_lens is None:
+            result = expanded
+        else:
+            result = append_kpool_tail_to_topk(
+                expanded,
+                seq_lens=seq_lens,
+                pool_lens=group_lengths,
+                pool_size=pool_size,
+                page_table=page_table,
+                topk_offsets=topk_offsets,
+            )
+
     if out_rows is None or out_rows == result.shape[0]:
         return result
     padded = torch.full(
