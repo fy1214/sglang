@@ -147,10 +147,22 @@ class DSAFlashInferMLASparseRunner:
         )
 
         # Host staging so FlashInfer plan()'s internal .to("cpu") is a no-op.
-        self._arange_cpu = torch.arange(max_tokens + 1, dtype=torch.int32)
-        self._qo_cpu = torch.empty(max_tokens + 1, dtype=torch.int32)
-        self._kv_cpu = torch.empty(max_tokens + 1, dtype=torch.int32)
-        self._lens_cpu = torch.zeros(max_tokens, dtype=torch.int32)
+        # Pin so wrapper.plan()'s reserved-buffer copy_ is Pinned→Device DMA
+        # (not Pageable→Device). Same pattern as dense flashinfer_mla_backend
+        # fast_plan_*_cpu buffers.
+        pin = torch.cuda.is_available()
+        self._arange_cpu = torch.arange(
+            max_tokens + 1, dtype=torch.int32, device="cpu", pin_memory=pin
+        )
+        self._qo_cpu = torch.empty(
+            max_tokens + 1, dtype=torch.int32, device="cpu", pin_memory=pin
+        )
+        self._kv_cpu = torch.empty(
+            max_tokens + 1, dtype=torch.int32, device="cpu", pin_memory=pin
+        )
+        self._lens_cpu = torch.zeros(
+            max_tokens, dtype=torch.int32, device="cpu", pin_memory=pin
+        )
         self._planned_num_tokens: int = -1
         # After CUDA-graph init, buffers are capture-stable; growing would
         # rebuild the wrapper and leave captured graphs on dangling pointers.
