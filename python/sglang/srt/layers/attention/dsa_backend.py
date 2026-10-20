@@ -1206,18 +1206,25 @@ class DeepseekSparseAttnBackend(
         dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
             forward_batch, dsa_cache_seqlens_int32
         )
-        # Host twin for BatchMLA plan: decode uses seq_lens_cpu; other modes
-        # fall back to a one-shot .cpu() of the just-built device tensor (eager
-        # metadata is outside the decode replay hot path).
-        if (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.seq_lens_cpu is not None
-        ):
+        # Host twin for BatchMLA plan — dense style host expand + clamp:
+        # ``_expand_seqlens_cpu`` + ``_host_dsa_cache_seqlens_cpu``.
+        if forward_batch.seq_lens_cpu is not None:
+            expanded_cpu = self._expand_seqlens_cpu(
+                forward_batch.seq_lens_cpu,
+                forward_batch.forward_mode,
+                batch_size,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            )
+            # Device EXTEND CP path: expand full then shard_local_tokens.
+            if (
+                forward_batch.forward_mode.is_context_parallel_extend()
+                and can_dsa_prefill_cp_interleave(forward_batch)
+            ):
+                expanded_cpu = get_cp_strategy().shard_local_tokens(expanded_cpu)
+                expanded_cpu = expanded_cpu.to(dtype=torch.int32, device="cpu")
             dsa_cache_seqlens_cpu = pad_dsa_cache_seqlens(
                 forward_batch,
-                self._host_dsa_cache_seqlens_cpu(
-                    forward_batch.seq_lens_cpu[:batch_size]
-                ),
+                self._host_dsa_cache_seqlens_cpu(expanded_cpu),
             )
         else:
             dsa_cache_seqlens_cpu = dsa_cache_seqlens_int32.detach().cpu()
@@ -1645,7 +1652,7 @@ class DeepseekSparseAttnBackend(
 
         if seq_lens_cpu is not None:
             dsa_cache_seqlens_cpu = self._host_dsa_cache_seqlens_cpu(
-                self._expand_seqlens_cpu_for_graph(seq_lens_cpu, forward_mode, bs)
+                self._expand_seqlens_cpu(seq_lens_cpu, forward_mode, bs)
             )
         else:
             dsa_cache_seqlens_cpu = dsa_cache_seqlens_int32.detach().cpu()
@@ -2000,7 +2007,7 @@ class DeepseekSparseAttnBackend(
                 metadata,
                 "dsa_cache_seqlens_cpu",
                 self._host_dsa_cache_seqlens_cpu(
-                    self._expand_seqlens_cpu_for_graph(seq_lens_cpu, forward_mode, bs)
+                    self._expand_seqlens_cpu(seq_lens_cpu, forward_mode, bs)
                 ),
             )
 
@@ -3085,29 +3092,65 @@ class DeepseekSparseAttnBackend(
         )
 
     def _host_dsa_cache_seqlens_cpu(self, seqlens_cpu: torch.Tensor) -> torch.Tensor:
-        """CPU ``compute_dsa_seqlens`` for BatchMLA plan (no device sync)."""
+        """CPU ``compute_dsa_seqlens`` (topk / kpool clamp) for BatchMLA plan."""
         return compute_dsa_seqlens(
             seqlens_cpu.to(dtype=torch.int32),
             dsa_index_topk=self.dsa_index_topk,
             index_kpool=self.dsa_index_kpool,
         )
 
-    def _expand_seqlens_cpu_for_graph(
+    def _expand_seqlens_cpu(
         self,
         seq_lens_cpu: torch.Tensor,
         forward_mode: ForwardMode,
         bs: int,
+        extend_seq_lens_cpu: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        """Host expand of per-req seq lens to per-query-row lengths (graph modes)."""
+        """Host expand of per-req seq lens to per-query-row lengths.
+
+        Shared by eager ``init_forward_metadata`` and cuda-graph capture/replay.
+        Prefill draft-extend is eager (no draft-extend graph); this is not
+        graph-only despite the old ``_expand_seqlens_cpu_for_graph`` name.
+
+        - decode: identity on ``seq_lens_cpu``
+        - EXTEND / draft_extend / mixed: ``extend_seq_lens_cpu`` + ``seq_lens_cpu``
+          → ``arange(kv_len - qo_len + 1, kv_len + 1)`` per req
+        - target_verify / graph draft_extend without extend list: fixed
+          ``draft_n`` rows with ``kv_len = seq_lens + draft_n``
+        """
         if forward_mode.is_decode_or_idle():
             return seq_lens_cpu[:bs].to(dtype=torch.int32)
+
+        # Eager EXTEND / DRAFT_EXTEND_V2 / MIXED: same expand as device
+        # seqlens_expand_triton / EXTEND torch.cat(arange...).
+        # Prefer this whenever host extend lengths exist (including draft_extend_v2).
+        if extend_seq_lens_cpu is not None and (
+            forward_mode.is_extend() or forward_mode.is_draft_extend_v2()
+        ):
+            # is_extend() includes TARGET_VERIFY — verify must use draft_n path.
+            if not forward_mode.is_target_verify():
+                parts: List[torch.Tensor] = []
+                for qo_len, kv_len in zip(
+                    extend_seq_lens_cpu, seq_lens_cpu[:bs].tolist(), strict=True
+                ):
+                    start = kv_len - qo_len + 1
+                    # kv_len >= qo_len always holds (seq_lens include the new
+                    # tokens); if it ever fails the row count drifts from
+                    # total_q and breaks parity with device seqlens_expand.
+                    assert start >= 0, f"{kv_len=} < {qo_len=}"
+                    parts.append(torch.arange(start, kv_len + 1, dtype=torch.int32))
+                if not parts:
+                    return torch.zeros(0, dtype=torch.int32)
+                return torch.cat(parts)
+
         draft_n = int(self.speculative_num_draft_tokens or 1)
         # Mirror capture/replay: kv_len = prefix+draft, each row j attends
         # kv_len - draft_n + j + 1 ... up to kv_len (draft_n rows per req).
-        parts: List[torch.Tensor] = []
+        parts = []
         for kv_len in (seq_lens_cpu[:bs].to(dtype=torch.int32) + draft_n).tolist():
-            start = int(kv_len) - draft_n + 1
-            parts.append(torch.arange(start, int(kv_len) + 1, dtype=torch.int32))
+            start = kv_len - draft_n + 1
+            assert start >= 0, f"{kv_len=} < {draft_n=}"
+            parts.append(torch.arange(start, kv_len + 1, dtype=torch.int32))
         if not parts:
             return torch.zeros(0, dtype=torch.int32)
         return torch.cat(parts)
