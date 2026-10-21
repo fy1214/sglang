@@ -842,6 +842,36 @@ def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states
 
 
+def sum_post_experts_output(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Complete the sum a MoE output owes over the EP and MoE-TP groups, for the
+    boundary that owns it; a path the combine already summed is left alone.
+
+    Prefill-CP layer_boundary ops expect this name (v0.5.22).
+    """
+    from sglang.srt.distributed.communication_op import (
+        moe_expert_parallel_all_reduce,
+        moe_tensor_model_parallel_all_reduce,
+        tensor_model_parallel_all_reduce,
+    )
+
+    parallel = get_parallel()
+    reduce_ep = parallel.moe_ep_size > 1 and not post_experts_output_is_complete(
+        is_tp_path=False
+    )
+    reduce_tp = parallel.moe_tp_size > 1 and not post_experts_output_is_complete(
+        is_tp_path=True
+    )
+
+    if reduce_ep and reduce_tp and can_merge_post_experts_all_reduce():
+        return tensor_model_parallel_all_reduce(hidden_states)
+
+    if reduce_ep:
+        hidden_states = moe_expert_parallel_all_reduce(hidden_states)
+    if reduce_tp:
+        hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+    return hidden_states
+
+
 def post_experts_reduction_group():
     """The group one all-reduce of an MoE output runs over: TP when the EP and
     MoE-TP reductions merge, otherwise EP, otherwise MoE-TP. The same group

@@ -200,6 +200,24 @@ def attn_tp_size_of(cfg: Any):
     return parallel_widths_of(cfg)["attn_tp_size"]
 
 
+def attn_dp_enabled_of(cfg: Any) -> bool:
+    """`attn_dp_enabled`, computed at publish.
+
+    True when attention DP is on (`enable_dp_attention` and `dp_size>1`), or
+    this process is an elastic EP scale joiner.
+    """
+    from sglang.srt.arg_groups.model_override_base import ep_scale_joiner_of
+
+    attn_dp = cfg.dp_size if getattr(cfg, "enable_dp_attention", False) else 1
+    return attn_dp > 1 or bool(ep_scale_joiner_of(cfg))
+
+
+def num_dp_ranks_of(cfg: Any) -> int:
+    """`num_dp_ranks`, computed at publish: replicas times attention-DP groups."""
+    attn_dp = cfg.dp_size if getattr(cfg, "enable_dp_attention", False) else 1
+    return cfg.dp_size * attn_dp
+
+
 def attn_dp_size_of(cfg: Any):
     """`attn_dp_size`, computed at publish. See `parallel_widths_of`."""
     return parallel_widths_of(cfg)["attn_dp_size"]
@@ -470,6 +488,26 @@ def _install_parallel_properties() -> None:
 
 
 _install_parallel_properties()
+
+
+def derive_attn_tp_size(*, tp_size: int, attn_cp_size: int, attn_dp_size: int) -> int:
+    """Return the attention-TP width left after attention-DP and attention-CP.
+
+    Compatibility alias expected by Prefill-CP ``dp_attention`` backport.
+    """
+    return tp_size // attn_dp_size // attn_cp_size
+
+
+def linear_attn_parallel_group() -> str:
+    """The group linear attention partitions its heads over: the attention-TP
+    group, or the TP group under CP-TP group sharing, where the attention-TP
+    group is one rank wide."""
+    return "tp" if get_parallel().enable_cp_tp_group_sharing else "attn_tp"
+
+
+def linear_attn_tp_size() -> int:
+    """The width of ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
 
 
 class _FlagGroupBase(msgspec.Struct):

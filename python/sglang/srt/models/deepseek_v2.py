@@ -62,6 +62,9 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+from sglang.srt.layers.attention.dsa.utils import (
+    maybe_prefetch_next_full_attention_kv,
+)
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -73,14 +76,11 @@ from sglang.srt.layers.dcp.planner import (
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
-    make_stages,
-)
-from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
-    maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -266,10 +266,24 @@ class DeepseekV2MLP(nn.Module):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         swiglu_limit: Optional[float] = None,
+        allow_fused_down: Optional[bool] = None,
+        *,
+        parallel_group=None,
     ) -> None:
+        if parallel_group is not None:
+            from sglang.srt.layers.linear import _compat_resolve_parallel_group
+
+            _r, _s = _compat_resolve_parallel_group(parallel_group)
+            if tp_rank is None:
+                tp_rank = _r
+            if tp_size is None:
+                tp_size = _s
         super().__init__()
         self.tp_size = tp_size
         self.swiglu_limit = swiglu_limit
+        self.allow_fused_down = (
+            not reduce_results if allow_fused_down is None else allow_fused_down
+        )
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -574,8 +588,11 @@ class DeepseekV2MoE(nn.Module):
         is_nextn: bool = False,
         is_deepseek_v4: bool = False,
         vl_correction_bias: bool = False,
+        reduce_results: bool = True,
     ):
         super().__init__()
+        # False when a CP/layer-boundary stage completes this output's sum.
+        self.reduce_results = reduce_results
         self.tp_size = get_parallel().tp_size
         self.moe_ep_size = get_parallel().moe_ep_size
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -2295,7 +2312,11 @@ class DeepseekV2AttentionMLA(
         input_on_attention_tp_slices: bool = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        *,
+        input_on_attn_tp_slices: Optional[bool] = None,
     ):
+        if input_on_attn_tp_slices is not None:
+            input_on_attention_tp_slices = input_on_attn_tp_slices
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
@@ -2316,7 +2337,11 @@ class DeepseekV2AttentionMLA(
         input_on_attention_tp_slices: bool = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        *,
+        input_on_attn_tp_slices: Optional[bool] = None,
     ):
+        if input_on_attn_tp_slices is not None:
+            input_on_attention_tp_slices = input_on_attn_tp_slices
         if self.attn_mha.kv_b_proj is None and hasattr(self, "kv_b_proj"):
             self.attn_mha.kv_b_proj = self.kv_b_proj
 
@@ -2645,7 +2670,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 
             fusions = CuteDSLFusion()
-        attn_boundary, ffn_boundary = make_stages(
+        attn_boundary, ffn_boundary = append_stages(
             (
                 declare_attn(),
                 input_layernorm,
@@ -2660,12 +2685,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 post_attention_layernorm,
                 {"fusions": fusions},
             ),
-            previous=declare_ffn(
-                sparse=self._stage_previous_sparse, next_sparse=self.is_layer_sparse
-            )
-            if not self._stage_enters_stack
-            else None,
-            terminal=self._stage_terminal,
         )
         return attn_boundary, ffn_boundary
 

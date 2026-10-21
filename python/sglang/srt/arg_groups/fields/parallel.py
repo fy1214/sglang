@@ -150,6 +150,17 @@ class Parallel(msgspec.Struct):
             choices=("zigzag", "interleave"),
         ),
     ] = None
+    enable_cp_tp_group_sharing: A[
+        bool,
+        Arg(
+            help="(Derived) CP-TP group sharing: prefill CP for hybrid "
+            "linear-attention models where the CP group is the TP group; the "
+            "residual stream, attention and indexer are CP-sharded while MoE "
+            "and linear attention keep TP. Resolved from the model architecture.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,
@@ -281,6 +292,16 @@ class Parallel(msgspec.Struct):
         fn="sglang.srt.runtime_context.attn_tp_size_of",
         doc="Attention tensor-parallel width: `tp_size` divided by the "
         "attention-DP and attention-CP dimensions.",
+    )
+    attn_dp_enabled = Derived(
+        fn="sglang.srt.runtime_context.attn_dp_enabled_of",
+        doc="Whether attention runs data parallel: `attn_dp_size` is wider "
+        "than one, or this process is an elastic EP scale joiner.",
+    )
+    num_dp_ranks = Derived(
+        fn="sglang.srt.runtime_context.num_dp_ranks_of",
+        doc="How many data-parallel ranks the deployment serves with: "
+        "`dp_size * attn_dp_size`.",
     )
     attn_dp_size = Derived(
         fn="sglang.srt.runtime_context.attn_dp_size_of",

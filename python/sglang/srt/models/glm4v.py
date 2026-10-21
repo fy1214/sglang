@@ -66,6 +66,12 @@ logger = logging.getLogger(__name__)
 cached_get_processor = lru_cache(get_processor)
 
 
+def glm4v_vision_reduces_over_attn_tp(use_data_parallel: bool) -> bool:
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+    return is_dp_attention_enabled() and not use_data_parallel
+
+
 class Glm4vRMSNorm(RMSNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape

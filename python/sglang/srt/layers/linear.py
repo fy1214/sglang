@@ -1829,3 +1829,44 @@ class ColumnParallelBatchedLinear(nn.Module):
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
         param.data[loaded_shard_id].copy_(loaded_weight)
+
+
+# --- Prefill-CP backport: accept parallel_group= on older tp_rank/tp_size linears ---
+def _compat_resolve_parallel_group(parallel_group):
+    """Map CP-backport ``parallel_group`` names onto ``(tp_rank, tp_size)``."""
+    if parallel_group is None:
+        return None, None
+    if parallel_group == "replicated":
+        return 0, 1
+    parallel = get_parallel()
+    name = parallel_group
+    if name not in ("tp", "attn_tp", "shared_experts_tp"):
+        raise ValueError(f"Unknown linear parallel_group: {parallel_group!r}")
+    return getattr(parallel, f"{name}_rank"), getattr(parallel, f"{name}_size")
+
+
+def _wrap_init_accept_parallel_group(cls):
+    orig_init = cls.__init__
+
+    def __init__(self, *args, parallel_group=None, **kwargs):
+        if parallel_group is not None:
+            rank, size = _compat_resolve_parallel_group(parallel_group)
+            kwargs.setdefault("tp_rank", rank)
+            kwargs.setdefault("tp_size", size)
+        return orig_init(self, *args, **kwargs)
+
+    cls.__init__ = __init__
+    return cls
+
+
+for _cls_name in (
+    "ColumnParallelLinear",
+    "MergedColumnParallelLinear",
+    "QKVParallelLinear",
+    "RowParallelLinear",
+    "MergedColumnParallelRepeatedLinear",
+    "ColumnParallelBatchedLinear",
+):
+    _cls = globals().get(_cls_name)
+    if _cls is not None:
+        _wrap_init_accept_parallel_group(_cls)

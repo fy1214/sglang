@@ -1495,15 +1495,32 @@ LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 def sharded_weight_loader(
     shard_axis: int,
     tp_rank_getter=None,
+    *,
+    parallel_group=None,
 ) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
+    if parallel_group is not None:
+        if tp_rank_getter is not None:
+            raise ValueError("parallel_group cannot be combined with tp_rank_getter")
+        from sglang.srt.layers.linear import _compat_resolve_parallel_group
+
+        _tp_rank, _tp_size = _compat_resolve_parallel_group(parallel_group)
+    else:
+        _tp_rank = None
+        _tp_size = None
+
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         tp_rank = (
-            tp_rank_getter()
-            if tp_rank_getter is not None
-            else get_parallel().attn_tp_rank
+            _tp_rank
+            if _tp_rank is not None
+            else (
+                tp_rank_getter()
+                if tp_rank_getter is not None
+                else get_parallel().attn_tp_rank
+            )
         )
+        tp_size = _tp_size if _tp_size is not None else get_parallel().tp_size
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
@@ -1511,8 +1528,8 @@ def sharded_weight_loader(
         if (
             is_cpu()
             and (
-                loaded_weight.size(0) % get_parallel().tp_size != 0
-                or loaded_weight.size(0) < get_parallel().tp_size * shard_size
+                loaded_weight.size(0) % tp_size != 0
+                or loaded_weight.size(0) < tp_size * shard_size
             )
             and loaded_weight.dim() == 1
         ):

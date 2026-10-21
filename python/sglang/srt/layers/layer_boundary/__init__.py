@@ -18,105 +18,107 @@ from sglang.srt.layers.layer_boundary.adapters.attention import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.layer_boundary.boundary import (
-    make_boundary,
-    make_output_boundary,
+    bind_entry,
+    bind_exit,
     tbo_split_moves,
 )
 from sglang.srt.layers.layer_boundary.construction import (
     BatchVariant,
-    StageEdges,
 )
 from sglang.srt.layers.layer_boundary.contracts import (
-    EdgeDecl,
-    FusedMlpInput,
-    HandoffRows,
+    EdgeContract,
+    EntryPath,
+    ExitRows,
+    FfnInputFusion,
+    InputContract,
+    OutputContract,
     ProducerReduction,
-    StageDecl,
-    StageEntry,
-    StageInput,
+    ReadoutFusion,
     StageKind,
-    StageOutput,
-    StageSteps,
+    StagePath,
 )
-from sglang.srt.layers.layer_boundary.exit import FfnCompletion, FfnExit, MixerExit
+from sglang.srt.layers.layer_boundary.exit import MixerExit
 from sglang.srt.layers.layer_boundary.factories import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_attn_stage,
-    make_ffn_stage,
+    layer_stack,
     make_stages,
 )
 from sglang.srt.layers.layer_boundary.layout import (
     Layout,
     SumGroup,
     TokenAxis,
+    batch_gathers_over_moe_cp,
     enable_moe_dense_fully_dp,
-    moe_cp_gathers_sparse_moe_input,
-    sparse_moe_gathers_over_moe_cp,
-    token_axis_sizes,
+    is_dense_ffn_fully_dp,
 )
 from sglang.srt.layers.layer_boundary.ops import (
     move_rows,
     tp_reduce_scatter,
 )
 from sglang.srt.layers.layer_boundary.output import (
-    HandoffOutput,
+    DeferredFinalize,
     UnreducedOutput,
-    reduce_output,
+    complete_owed,
 )
-from sglang.srt.layers.layer_boundary.residual import LayerResidual
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
-    ADD,
     FUSE_ALLREDUCE_MAX_BATCH_SIZE,
-    NORM_QUANT_READ,
-    NORM_READ,
-    PLAIN_RESIDUAL,
+    NORM_QUANT_READOUT,
+    PLAIN_ADD,
+    PLAIN_RESIDUAL_OPS,
+)
+from sglang.srt.layers.layer_boundary.residual.gated import (
+    GatedResidualState,
+)
+from sglang.srt.layers.layer_boundary.residual.ihc import (
+    IHCState,
 )
 from sglang.srt.layers.layer_boundary.residual.mhc import (
     MHCState,
 )
 
+HandoffRows = ExitRows  # compat alias for Prefill-CP rename
+
 __all__ = [
     "declare_attn",
     "declare_ffn",
-    "make_attn_stage",
-    "make_ffn_stage",
+    "append_stages",
     "make_stages",
-    "ADD",
+    "layer_stack",
+    "PLAIN_ADD",
     "AttentionInputs",
-    "StageSteps",
-    "EdgeDecl",
+    "StagePath",
+    "EdgeContract",
+    "ExitRows",
     "HandoffRows",
     "ProducerReduction",
     "FUSE_ALLREDUCE_MAX_BATCH_SIZE",
-    "FfnCompletion",
-    "FfnExit",
-    "FusedMlpInput",
-    "HandoffOutput",
-    "LayerResidual",
+    "FfnInputFusion",
+    "ReadoutFusion",
+    "DeferredFinalize",
+    "GatedResidualState",
+    "IHCState",
     "Layout",
     "MHCState",
     "MixerExit",
-    "NORM_QUANT_READ",
-    "NORM_READ",
-    "PLAIN_RESIDUAL",
-    "StageDecl",
-    "StageEntry",
-    "StageInput",
+    "NORM_QUANT_READOUT",
+    "PLAIN_RESIDUAL_OPS",
+    "EntryPath",
+    "InputContract",
     "StageKind",
-    "StageOutput",
+    "OutputContract",
     "SumGroup",
     "TokenAxis",
     "UnreducedOutput",
     "enable_moe_dense_fully_dp",
+    "is_dense_ffn_fully_dp",
     "get_attn_tp_context",
-    "make_boundary",
-    "make_output_boundary",
-    "moe_cp_gathers_sparse_moe_input",
+    "bind_entry",
+    "bind_exit",
+    "batch_gathers_over_moe_cp",
     "move_rows",
-    "reduce_output",
-    "sparse_moe_gathers_over_moe_cp",
+    "complete_owed",
     "tbo_split_moves",
-    "token_axis_sizes",
     "tp_reduce_scatter",
 ]

@@ -12,6 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 
+"""Compat shim: Prefill-CP #42036 deleted this adapter, but older deepseek_v4
+still imports it for MHC fuse. Keep the gather/RS helpers importable.
+"""
 
 from typing import Optional
 
@@ -34,13 +37,6 @@ def maybe_prefetch_next_full_attention_kv(
     forward_batch: ForwardBatch,
     next_full_attention_layer_id: Optional[int],
 ) -> None:
-    """Prefetch (owner-broadcast) the next layer's DSA KV under layer split.
-
-    No-op unless the current batch runs DSA prefill-CP and the active KV pool is
-    a layer-sharded pool exposing ``prefetch_kv_buffer`` (i.e.
-    ``LayerSplitDSATokenToKVPool``). Kicking the broadcast off one layer ahead
-    overlaps it with the current layer's attention compute.
-    """
     if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
         return
 
