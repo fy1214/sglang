@@ -638,10 +638,16 @@ class DeepseekMHAForwardMixin:
 
         Returns: (kv_a, k_pe) both in BF16
         """
-        backend = get_attn_backend()
-        if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
-            backend = backend.primary
-        kv_indices = backend.forward_metadata.page_table_1_flattened
+        # Must unwrap HybridLinearAttnBackend / HybridAttnBackend / TBO — the
+        # wrapper's forward_metadata stays None; DSA page_table lives on the
+        # full-attn child that init_forward_metadata actually planned.
+        backend = resolve_attn_backend(forward_batch)
+        metadata = backend.forward_metadata
+        assert metadata is not None, (
+            "DSA forward_metadata missing for FP8 MHA one-shot path; "
+            f"resolved backend={type(backend).__name__}"
+        )
+        kv_indices = metadata.page_table_1_flattened
         assert kv_indices is not None, (
             "page_table_1_flattened should have been generated for FP8 MHA path"
         )
