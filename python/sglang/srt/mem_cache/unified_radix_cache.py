@@ -268,6 +268,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
+        # HiCache idle-skip accounting for check_hicache_events. submitted is
+        # bumped only at scheduler-driven submission points and acked only from
+        # collective (all_reduce MIN) results, so both are identical across
+        # ranks at every check point; testing them for equality cannot diverge
+        # between ranks and skipping cannot deadlock the collective.
+        self._hc_linker_submitted = [0, 0]  # [loads, offloads]
+        self._hc_linker_acked = [0, 0]
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -1329,6 +1336,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 [action.new_node_id, action.new_child_node_id],
             )
             if self.linker is not None:
+                self._hc_linker_submitted[1] += 1
                 self.linker.replace_pending_offload_node(
                     action.ack_id,
                     action.old_node_id,
@@ -1343,6 +1351,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free_full_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             if self.linker is not None:
+                self._hc_linker_submitted[1] += 1
                 self.linker.offload_nodes(action.node_ids)
             else:
                 self._execute_and_commit_kv_backup(action)
@@ -3413,6 +3422,7 @@ class UnifiedRadixCache(BasePrefixCache):
         req = params.req
         assert req is not None
         if self.linker is not None and self.linker.has_hit(req.rid):
+            self._hc_linker_submitted[0] += 1
             return self.linker.load_back(req)
         last_best_match_device_node_id = req.last_node
 
@@ -3446,9 +3456,36 @@ class UnifiedRadixCache(BasePrefixCache):
             last_best_match_device_node_id,
         )
 
+    def _hicache_controller_quiescent(self) -> bool:
+        """True when no HiCache D↔H work can be in flight or pending.
+
+        Every queue inspected here is appended only by scheduler-driven
+        submissions (deterministic across ranks: same requests, same cache
+        decisions) and popped only by collective-derived counts (identical
+        across ranks), so the emptiness verdict cannot diverge and skipping
+        the round cannot deadlock the collective. Conservative escapes:
+        PP>1 (cross-PP queue consistency not established) and storage L3
+        (its control queues are populated by async workers).
+        """
+        cc = self.cache_controller
+        if cc is None:
+            return True
+        if self.pp_size > 1 or self.enable_storage:
+            return False
+        if self.work_list:
+            return False
+        return not (
+            cc.write_queue or cc.ack_write_queue or cc.load_queue or cc.ack_load_queue
+        )
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
+            if self._hc_linker_submitted == self._hc_linker_acked:
+                # Nothing submitted since the last fully-acked round: no rank
+                # can have a completion to report, so every rank skips the
+                # collective together.
+                return
             finish_counts = torch.tensor(
                 [
                     self.linker.num_completed_loads(),
@@ -3459,6 +3496,8 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
             load_count, offload_count = map(int, finish_counts.tolist())
+            self._hc_linker_acked[0] += load_count
+            self._hc_linker_acked[1] += offload_count
             self.linker.drain_loads(load_count)
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
@@ -3467,6 +3506,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.commit_completed_offloads(
                     [bool(success) for success in successes.tolist()]
                 )
+            return
+
+        if self._hicache_controller_quiescent():
             return
 
         # Reap the previous round's PP-sync sends before issuing new ones.
