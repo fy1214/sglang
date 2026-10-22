@@ -310,6 +310,10 @@ class FutureMap:
         self.accept_lens_buf: Optional[torch.Tensor] = None
 
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
+        # Recorded on fwd_prepare_d2h_stream right after the publish-time D2H
+        # relay of new_seq_lens_buf; resolve_seq_lens_cpu waits on this event
+        # instead of synchronizing the stream at schedule time.
+        self.seq_lens_cpu_ready = None
         # Debug consume-once state: armed by a recording publish, consumed by
         # resolve; arm/consume strictly alternate across all batch interleavings.
         self._publish_fresh = False
@@ -546,19 +550,22 @@ class FutureMap:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
-        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
+        if (
+            self.fwd_prepare_d2h_stream is None
+            or self.publish_ready is None
+            or self.seq_lens_cpu_ready is None
+        ):
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             if _DEBUG_ASSERT:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
-        # Mechanism: don't sync the schedule stream; gate a private stream on the
-        # publish event and copy into the static pinned buffer.
-        self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
-        with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
-            self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
-        self.fwd_prepare_d2h_stream.synchronize()
+        # The D2H relay was already issued at publish time (mid-forward, off
+        # the scheduler critical path); only wait for that copy's event. The
+        # pinned mirror is stable until the next publish, which cannot start
+        # before this resolve returns (next forward launches after it).
+        self.seq_lens_cpu_ready.synchronize()
 
         # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
         batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
@@ -587,6 +594,26 @@ class FutureMap:
                 self.publish_ready = torch.get_device_module(self.device).Event()
             self.publish_ready.record()
             self._publish_fresh = True
+            # Relay the CPU mirror eagerly at publish time (worker thread,
+            # mid-forward) instead of at resolve time (scheduler thread,
+            # critical path). The copy is tiny and gated only on the publish
+            # event, so by the time the scheduler resolves next round it has
+            # long landed; resolve then waits on seq_lens_cpu_ready, which is
+            # effectively free, instead of blocking the schedule stream on a
+            # copy that still has to be issued.
+            if self.needs_cpu_seq_lens and self.fwd_prepare_d2h_stream is not None:
+                self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
+                with torch.get_device_module(self.device).stream(
+                    self.fwd_prepare_d2h_stream
+                ):
+                    self.new_seq_lens_cpu_pinned.copy_(
+                        self.new_seq_lens_buf, non_blocking=True
+                    )
+                    if self.seq_lens_cpu_ready is None:
+                        self.seq_lens_cpu_ready = torch.get_device_module(
+                            self.device
+                        ).Event()
+                    self.seq_lens_cpu_ready.record(self.fwd_prepare_d2h_stream)
         if publish_confidence:
             self.confidence_relay.issue_ring_copy(
                 stream=self.fwd_prepare_d2h_stream,

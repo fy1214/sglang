@@ -383,6 +383,12 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
+        # kpool>1 keeps the CPU seq_lens mirror: the spec-v2 relay that feeds
+        # it is nearly free since the publish-time D2H relay lands off the
+        # scheduler critical path (overlap_utils), and CPU lens let the
+        # metadata paths build the BatchMLA host twin on the host instead of
+        # a blocking per-round detach().cpu() D2H on the worker thread
+        # (dsa_backend precompute/replay fast paths).
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
         self._init_kpool_metadata_fusion()
         self.max_context_len = model_runner.model_config.context_len
@@ -2058,15 +2064,21 @@ class DeepseekSparseAttnBackend(
             metadata, precomputed, forward_mode
         )
 
-        # MTP precomputed path: host twin from the just-copied device buffer.
-        # Decode replay uses seq_lens_cpu instead (no D2H); this path is rarer.
+        # MTP precomputed path: prefer the host twin built from seq_lens_cpu
+        # in _precompute_replay_metadata (no D2H); fall back to a device
+        # readback only when no CPU lens were available (rare).
         # DSAMetadata is frozen — must use object.__setattr__.
         if self._flashinfer_mla_sparse_runner is not None:
-            object.__setattr__(
-                metadata,
-                "dsa_cache_seqlens_cpu",
-                precomputed.dsa_cache_seqlens.detach().cpu(),
-            )
+            twin = precomputed.dsa_cache_seqlens_cpu
+            if twin is None:
+                twin = precomputed.dsa_cache_seqlens.detach().cpu()
+            else:
+                # Align with the (possibly DP/CP-padded) device buffer length;
+                # padded rows read as zero kv_len, matching the device side.
+                n = precomputed.dsa_cache_seqlens.shape[0]
+                if twin.shape[0] < n:
+                    twin = torch.cat([twin, twin.new_zeros(n - twin.shape[0])])
+            object.__setattr__(metadata, "dsa_cache_seqlens_cpu", twin)
 
         self.forward_metadata = metadata
         self._plan_flashinfer_mla_sparse(metadata)

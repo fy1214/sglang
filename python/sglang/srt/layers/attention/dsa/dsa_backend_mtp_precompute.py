@@ -54,6 +54,11 @@ class PrecomputedMetadata:
     # FlashMLA (optional)
     flashmla_metadata: Optional[torch.Tensor] = None
 
+    # Host twin of dsa_cache_seqlens for BatchMLA plan, built from
+    # seq_lens_cpu when available (no D2H); None forces the rare
+    # detach().cpu() fallback in the replay fast path.
+    dsa_cache_seqlens_cpu: Optional[torch.Tensor] = None
+
 
 def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
     """Compute cumulative sequence lengths with padding."""
@@ -102,15 +107,24 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
 
         # Dispatch to mode-specific precomputation
         if forward_mode.is_decode_or_idle():
-            return self._precompute_decode_mode(
+            precomputed = self._precompute_decode_mode(
                 bs, req_pool_indices, seq_lens, seq_lens_cpu
             )
         elif forward_mode.is_target_verify():
-            return self._precompute_target_verify_mode(
+            precomputed = self._precompute_target_verify_mode(
                 bs, req_pool_indices, seq_lens, seq_lens_cpu
             )
         else:
             raise ValueError(f"Unsupported forward mode: {forward_mode}")
+
+        # Host twin for BatchMLA plan, expanded from CPU lens on the host
+        # (mirrors the decode-replay host path; keeps the replay fast path
+        # free of the per-round detach().cpu() D2H).
+        if seq_lens_cpu is not None:
+            precomputed.dsa_cache_seqlens_cpu = self._host_dsa_cache_seqlens_cpu(
+                self._expand_seqlens_cpu(seq_lens_cpu, forward_mode, bs)
+            )
+        return precomputed
 
     def _precompute_decode_mode(
         self,

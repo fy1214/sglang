@@ -1425,8 +1425,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.input_ids = None
                 # Attention metadata planning reads the CPU copies; one D2H
                 # per round (TODO: async or upper-bound estimate).
-                batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
-                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                # When every spec backend opts out of the CPU mirror (e.g.
+                # DSA, needs_cpu_seq_lens=False), the draft metadata paths
+                # are all None-safe (static graph widths, GPU fallbacks,
+                # upper-bound verify-mask), so skip the D2H entirely.
+                from sglang.srt.managers.overlap_utils import (
+                    decide_needs_cpu_seq_lens,
+                )
+
+                if decide_needs_cpu_seq_lens(self.spec_v2_attn_backends):
+                    batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
+                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                else:
+                    batch.seq_lens_cpu = None
+                    batch.seq_lens_sum = None
                 with (
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group,
