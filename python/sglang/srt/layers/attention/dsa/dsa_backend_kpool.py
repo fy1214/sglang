@@ -80,8 +80,8 @@ class DeepseekSparseAttnBackendKPoolMixin:
             return "fa3"
         return dsa_impl
 
-    def _kpool_index_page_size(self) -> int:
-        return self.token_to_kv_pool.index_page_size
+    def _kpool_slots_per_page(self) -> int:
+        return getattr(self.token_to_kv_pool, "slots_per_page", self.real_page_size)
 
     def _build_kpool_paged_mqa_schedule_metadata(self) -> bool:
         if self.device_sm_major == 9:
@@ -99,7 +99,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
             return metadata
 
         forward_mode = forward_batch.forward_mode
-        index_page_size = self._kpool_index_page_size()
+        slots_per_page = self._kpool_slots_per_page()
         build_schedule_metadata = self._build_kpool_paged_mqa_schedule_metadata()
         if forward_mode.is_extend_without_speculative():
             assert topk_transform_method is not None
@@ -107,9 +107,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
             return init_kpool_extend_metadata(
                 metadata,
                 forward_batch,
-                kpool=self.dsa_index_kpool,
-                physical_page_size=self.physical_page_size,
-                index_page_size=index_page_size,
+                pool_size=self.dsa_index_kpool,
+                real_page_size=self.real_page_size,
+                slots_per_page=slots_per_page,
                 topk_transform_method=topk_transform_method,
                 full_real_page_table=kpool_inputs.full_real_page_table,
                 full_seqlens_expanded=kpool_inputs.full_seqlens_expanded,
@@ -120,9 +120,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
             metadata,
             metadata.cache_seqlens_int32,
             forward_mode,
-            kpool=self.dsa_index_kpool,
-            physical_page_size=self.physical_page_size,
-            index_page_size=index_page_size,
+            pool_size=self.dsa_index_kpool,
+            real_page_size=self.real_page_size,
+            slots_per_page=slots_per_page,
             build_schedule_metadata=build_schedule_metadata,
         )
 
@@ -130,12 +130,12 @@ class DeepseekSparseAttnBackendKPoolMixin:
             return init_kpool_write_plan(
                 metadata,
                 forward_batch,
-                kpool=self.dsa_index_kpool,
-                physical_page_size=self.physical_page_size,
+                pool_size=self.dsa_index_kpool,
+                real_page_size=self.real_page_size,
                 real_page_table=metadata.real_page_table,
                 num_draft_tokens=1,
                 write_start=(forward_batch.seq_lens - 1).to(torch.int32),
-                index_page_size=index_page_size,
+                slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
             )
 
@@ -143,12 +143,12 @@ class DeepseekSparseAttnBackendKPoolMixin:
             return init_kpool_write_plan(
                 metadata,
                 forward_batch,
-                kpool=self.dsa_index_kpool,
-                physical_page_size=self.physical_page_size,
+                pool_size=self.dsa_index_kpool,
+                real_page_size=self.real_page_size,
                 real_page_table=metadata.real_page_table,
                 num_draft_tokens=self.speculative_num_draft_tokens,
                 write_start=forward_batch.seq_lens.to(torch.int32),
-                index_page_size=index_page_size,
+                slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
             )
 
@@ -163,14 +163,14 @@ class DeepseekSparseAttnBackendKPoolMixin:
             return init_kpool_write_plan(
                 metadata,
                 forward_batch,
-                kpool=self.dsa_index_kpool,
-                physical_page_size=self.physical_page_size,
+                pool_size=self.dsa_index_kpool,
+                real_page_size=self.real_page_size,
                 real_page_table=metadata.real_page_table,
                 num_draft_tokens=self.speculative_num_draft_tokens,
                 write_start=(
                     forward_batch.seq_lens - self.speculative_num_draft_tokens
                 ).to(torch.int32),
-                index_page_size=index_page_size,
+                slots_per_page=slots_per_page,
                 effective_n_per_batch=effective_n_per_batch,
                 build_schedule_metadata=build_schedule_metadata,
             )
@@ -183,15 +183,15 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if self.dsa_index_kpool <= 1:
             return metadata
 
-        index_page_size = self._kpool_index_page_size()
+        slots_per_page = self._kpool_slots_per_page()
         build_schedule_metadata = self._build_kpool_paged_mqa_schedule_metadata()
         metadata = init_pooled_paged_mqa_metadata(
             metadata,
             metadata.cache_seqlens_int32,
             forward_mode,
-            kpool=self.dsa_index_kpool,
-            physical_page_size=self.physical_page_size,
-            index_page_size=index_page_size,
+            pool_size=self.dsa_index_kpool,
+            real_page_size=self.real_page_size,
+            slots_per_page=slots_per_page,
             build_schedule_metadata=build_schedule_metadata,
         )
 
@@ -205,14 +205,14 @@ class DeepseekSparseAttnBackendKPoolMixin:
             metadata = init_kpool_write_plan_capture(
                 metadata,
                 max_bs=bs,
-                kpool=self.dsa_index_kpool,
-                physical_page_size=self.physical_page_size,
+                pool_size=self.dsa_index_kpool,
+                real_page_size=self.real_page_size,
                 num_draft_tokens=(
                     1 if is_decode else self.speculative_num_draft_tokens
                 ),
                 device=self.device,
                 is_verify=not is_decode,
-                index_page_size=index_page_size,
+                slots_per_page=slots_per_page,
                 is_v2=is_v2,
                 build_schedule_metadata=build_schedule_metadata,
             )
@@ -230,15 +230,15 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if self.dsa_index_kpool <= 1:
             return
 
-        index_page_size = self._kpool_index_page_size()
+        slots_per_page = self._kpool_slots_per_page()
         build_schedule_metadata = self._build_kpool_paged_mqa_schedule_metadata()
         update_pooled_paged_mqa_metadata(
             metadata,
             metadata.cache_seqlens_int32,
             forward_mode,
-            kpool=self.dsa_index_kpool,
-            physical_page_size=self.physical_page_size,
-            index_page_size=index_page_size,
+            pool_size=self.dsa_index_kpool,
+            real_page_size=self.real_page_size,
+            slots_per_page=slots_per_page,
             build_schedule_metadata=build_schedule_metadata,
         )
 
@@ -264,11 +264,11 @@ class DeepseekSparseAttnBackendKPoolMixin:
             write_start=write_start,
             req_pool_indices=req_pool_indices,
             real_page_table=metadata.real_page_table,
-            kpool=self.dsa_index_kpool,
-            physical_page_size=self.physical_page_size,
+            pool_size=self.dsa_index_kpool,
+            real_page_size=self.real_page_size,
             num_draft_tokens=(1 if is_decode else self.speculative_num_draft_tokens),
             forward_mode=forward_mode,
-            index_page_size=index_page_size,
+            slots_per_page=slots_per_page,
             effective_n_per_batch=effective_n_per_batch,
         )
 
@@ -281,15 +281,15 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if self.dsa_index_kpool <= 1:
             return
 
-        index_page_size = self._kpool_index_page_size()
+        slots_per_page = self._kpool_slots_per_page()
         build_schedule_metadata = self._build_kpool_paged_mqa_schedule_metadata()
         update_pooled_paged_mqa_metadata(
             metadata,
             precomputed.cache_seqlens,
             forward_mode,
-            kpool=self.dsa_index_kpool,
-            physical_page_size=self.physical_page_size,
-            index_page_size=index_page_size,
+            pool_size=self.dsa_index_kpool,
+            real_page_size=self.real_page_size,
+            slots_per_page=slots_per_page,
             build_schedule_metadata=build_schedule_metadata,
         )
 
@@ -308,9 +308,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
             write_start=write_start,
             req_pool_indices=precomputed.req_pool_indices,
             real_page_table=metadata.real_page_table,
-            kpool=self.dsa_index_kpool,
-            physical_page_size=self.physical_page_size,
+            pool_size=self.dsa_index_kpool,
+            real_page_size=self.real_page_size,
             num_draft_tokens=self.speculative_num_draft_tokens if is_verify else 1,
             forward_mode=forward_mode,
-            index_page_size=index_page_size,
+            slots_per_page=slots_per_page,
         )
