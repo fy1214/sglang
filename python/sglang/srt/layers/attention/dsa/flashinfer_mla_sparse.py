@@ -164,6 +164,7 @@ class DSAFlashInferMLASparseRunner:
             max_tokens, dtype=torch.int32, device="cpu", pin_memory=pin
         )
         self._planned_num_tokens: int = -1
+        self._last_kv_lens: Optional[torch.Tensor] = None
         # After CUDA-graph init, buffers are capture-stable; growing would
         # rebuild the wrapper and leave captured graphs on dangling pointers.
         self._capacity_frozen: bool = False
@@ -229,12 +230,37 @@ class DSAFlashInferMLASparseRunner:
             kv_lens[:num_tokens].to(dtype=torch.int32).clamp(min=0, max=self.topk_width)
         )
 
-        # Full-size host buffers: use_cuda_graph plan does exact-size copy_.
-        torch.clamp(self._arange_cpu, max=num_tokens, out=self._qo_cpu)
-        self._lens_cpu.zero_()
+        # Steady-state shortcut: the C++ plan is a pure function of
+        # (num_tokens, kv_lens) — a greedy host-side cluster scheduling. For
+        # DSA sparse decode/verify/draft_extend every active row clamps to
+        # the same topk width once contexts exceed it, so an unchanged
+        # (num_tokens, kv_lens) replans to the identical schedule. Skip the
+        # host scheduling, the H2D buffer DMAs and the C++ call; the reserved
+        # buffers and _plan_info still hold exactly the right values. Rows
+        # with shorter contexts (new requests) change kv_lens and take the
+        # full path. The equality check is a few us over a small CPU tensor.
+        if (
+            self._planned_num_tokens == num_tokens
+            and self._last_kv_lens is not None
+            and self._last_kv_lens.shape[0] == num_tokens
+            and torch.equal(self._last_kv_lens, kv_lens)
+        ):
+            return
+
+        # qo_indptr is clamp(arange), a pure function of num_tokens — rebuild
+        # only when the span changes. The C++ plan infers the span from the
+        # qo_indptr contents, so only the first num_tokens entries of
+        # kv_len_arr and the first num_tokens+1 of kv_indptr are ever read;
+        # the tail of the reserved buffers is dead weight. Skip the
+        # full-width zero_/cumsum (over up to max_tokens entries) in favor of
+        # exact-span writes — CPU time scales with num_tokens, not capacity.
+        if num_tokens != self._planned_num_tokens:
+            torch.clamp(self._arange_cpu, max=num_tokens, out=self._qo_cpu)
         self._lens_cpu[:num_tokens] = kv_lens
         self._kv_cpu[0] = 0
-        torch.cumsum(self._lens_cpu, dim=0, out=self._kv_cpu[1:])
+        torch.cumsum(
+            self._lens_cpu[:num_tokens], dim=0, out=self._kv_cpu[1 : 1 + num_tokens]
+        )
 
         # Pass the full reserved kv_indices buffer (dense BatchMLA cuda-graph
         # replay style). Effective span is described by kv_len_arr / kv_indptr;
@@ -253,6 +279,7 @@ class DSAFlashInferMLASparseRunner:
             self.q_dtype,
             self.kv_dtype,
         )
+        self._last_kv_lens = kv_lens.clone()
         self._planned_num_tokens = num_tokens
 
     def pack_indices(self, page_table: torch.Tensor) -> None:

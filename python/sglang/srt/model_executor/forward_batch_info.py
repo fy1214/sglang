@@ -159,6 +159,28 @@ def _maybe_build_forward_token_modalities(
     )
 
 
+def _get_mlp_sync_pinned(length: int, device: Union[str, torch.device]) -> torch.Tensor:
+    """Persistent pinned int64 staging for MLP-sync token counts.
+
+    Allocating fresh pinned memory per batch costs a cudaHostAlloc that
+    serializes with the driver; reuse one geometrically-grown buffer per
+    device instead (same idiom as the flashinfer fast_plan_*_cpu staging).
+    """
+    if not is_pin_memory_available(device):
+        return torch.empty(length, dtype=torch.int64)
+    dev = torch.device(device)
+    key = dev.index if dev.index is not None else torch.cuda.current_device()
+    buf = _MLP_SYNC_PINNED_BUFFERS.get(key)
+    if buf is None or buf.shape[0] < length:
+        cap = max(64, 1 << (length - 1).bit_length())
+        buf = torch.empty(cap, dtype=torch.int64, pin_memory=True)
+        _MLP_SYNC_PINNED_BUFFERS[key] = buf
+    return buf
+
+
+_MLP_SYNC_PINNED_BUFFERS: Dict[int, torch.Tensor] = {}
+
+
 def _mega_moe_materializes_idle_rank(batch: ForwardBatch) -> bool:
     """Whether aiter MegaMoE needs this idle rank to carry a token anyway.
 
@@ -920,16 +942,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = global_num_tokens_source
         self.global_num_tokens_cpu = global_num_tokens
-        pin_memory = is_pin_memory_available(device)
-        self.global_num_tokens_gpu = torch.tensor(
-            global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
+        # Reuse persistent pinned staging buffers instead of allocating fresh
+        # pinned memory per batch (cudaHostAlloc serializes with the driver
+        # and showed up as multi-ms stalls under GPU backlog). Same idiom as
+        # the flashinfer_mla fast_plan_*_cpu staging. Writes land between two
+        # H2D copies on the same stream, so the DMA ordering protects them;
+        # the values are a handful of per-rank counts.
+        pin_num_tokens = _get_mlp_sync_pinned(len(global_num_tokens), device)
+        pin_num_tokens[: len(global_num_tokens)].copy_(
+            # torch.tensor (not as_tensor): keeps the original semantics of
+            # materializing on CPU even if the source were a CUDA tensor.
+            torch.tensor(global_num_tokens, dtype=torch.int64)
+        )
+        self.global_num_tokens_gpu = pin_num_tokens[: len(global_num_tokens)].to(
+            device, non_blocking=True
+        )
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-        self.global_num_tokens_for_logprob_gpu = torch.tensor(
-            global_num_tokens_for_logprob,
-            dtype=torch.int64,
-            pin_memory=pin_memory,
-        ).to(device, non_blocking=True)
+        pin_for_logprob = _get_mlp_sync_pinned(
+            len(global_num_tokens_for_logprob), device
+        )
+        pin_for_logprob[: len(global_num_tokens_for_logprob)].copy_(
+            torch.tensor(global_num_tokens_for_logprob, dtype=torch.int64)
+        )
+        self.global_num_tokens_for_logprob_gpu = pin_for_logprob[
+            : len(global_num_tokens_for_logprob)
+        ].to(device, non_blocking=True)
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         self.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
 
