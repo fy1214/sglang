@@ -2,6 +2,33 @@ import torch
 import triton
 import triton.language as tl
 
+# FlashInfer SM90 BatchMLA G=1 packed row: [512 e4m3 | fp32 scale | 12B pad] = 528.
+# Scale slot is 16B even when only one fp32 scale is live (pad for 16B alignment).
+FP8_G1_SCALE_SLOT_BYTES = 16
+
+
+def fp8_kv_scale_slot_bytes(dim_nope: int, group_size: int) -> int:
+    """Bytes reserved for FP8 NoPE scales in a packed DSA KV row."""
+    if dim_nope % group_size != 0:
+        raise ValueError(
+            f"dim_nope={dim_nope} must be divisible by group_size={group_size}"
+        )
+    num_tiles = dim_nope // group_size
+    if num_tiles == 1:
+        return FP8_G1_SCALE_SLOT_BYTES
+    return num_tiles * 4
+
+
+def fp8_kv_packed_row_bytes(
+    dim_nope: int, dim_rope: int, group_size: int, rope_elem_size: int = 2
+) -> int:
+    """Packed DSA FP8 row width: nope_fp8 + scale_slot + rope_bf16_bytes."""
+    return (
+        dim_nope
+        + fp8_kv_scale_slot_bytes(dim_nope, group_size)
+        + dim_rope * rope_elem_size
+    )
+
 
 def gather_dsa_kv_scales(
     scale_src,
@@ -71,16 +98,18 @@ def quantize_k_cache_separate(
 
     Args:
         k_nope: (num_tokens, dim_nope) or (num_tokens, 1, dim_nope)
-                dim_nope must be divisible by 128
+                dim_nope must be divisible by ``tile_size``
         k_rope: (num_tokens, dim_rope) or (num_tokens, 1, dim_rope)
                 Must have dim_rope=64 for FP8 MLA quantization, or dim_rope=0
                 for no-PE MLA (empty rope); None is treated
                 the same as an empty rope.
-        tile_size: quantization tile size (default 128)
+        tile_size: quantization tile size. ``128`` → G=4 (4 scales / 512-d);
+                ``512`` (or ``dim_nope``) → G=1 per-token scale with a 16B
+                scale slot (4B live + 12B pad) for FlashInfer packed rows.
 
     Returns:
         Tuple of (nope_part, rope_part) where:
-        - nope_part: uint8 view containing [nope_fp8 | one FP32 scale per tile]
+        - nope_part: uint8 view containing [nope_fp8 | scale_slot]
         - rope_part: uint8 view containing the raw BF16 RoPE bytes
                      (empty, (num_tokens, 1, 0), when dim_rope=0)
 
@@ -221,14 +250,22 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
     assert k_nope.stride(1) == 1
     assert k_rope.stride(1) == 1
 
-    output = torch.empty(
-        (num_tokens, dim_nope + num_tiles * 4 + k_rope.element_size() * dim_rope),
+    scale_slot_bytes = fp8_kv_scale_slot_bytes(dim_nope, group_size)
+    # zeros: G=1 pad bytes in the scale slot must not be left uninitialized.
+    output = torch.zeros(
+        (
+            num_tokens,
+            dim_nope + scale_slot_bytes + k_rope.element_size() * dim_rope,
+        ),
         dtype=torch.float8_e4m3fn,
         device=k_nope.device,
     )
     output_nope_q = output[..., :dim_nope]
-    output_nope_s = output[..., dim_nope : dim_nope + num_tiles * 4].view(torch.float32)
-    output_rope = output[..., dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+    # G=1 pads the scale slot to 16B; only the first num_tiles floats are written.
+    output_nope_s = output[..., dim_nope : dim_nope + scale_slot_bytes].view(
+        torch.float32
+    )
+    output_rope = output[..., dim_nope + scale_slot_bytes :].view(torch.bfloat16)
 
     num_blocks_per_token = num_tiles + triton.cdiv(dim_rope, group_size)
 
@@ -282,17 +319,19 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
     num_tiles = dim_nope // group_size
 
     # Calculate byte sizes based on validated dimensions
-    # nope_part: [FP8 quantized data (dim_nope bytes)] + [FP32 scales (num_tiles * 4 bytes)]
+    # nope_part: [FP8 quantized data (dim_nope bytes)] + [scale slot]
+    #   G=4 (group=128): 512 + 16 (=4*fp32)
+    #   G=1 (group=512): 512 + 16 (=1*fp32 + 12B pad) for FlashInfer packed rows
     # rope_part: [BF16 raw data (dim_rope * 2 bytes)]
-    nope_part_bytes = (
-        dim_nope + num_tiles * 4
-    )  # e.g., 512 + 4*4 = 528 for dim_nope=512, group_size=128
+    scale_slot_bytes = fp8_kv_scale_slot_bytes(dim_nope, group_size)
+    nope_part_bytes = dim_nope + scale_slot_bytes
     rope_part_bytes = (
         dim_rope * k_rope.element_size()
     )  # e.g., 64 * 2 = 128 for dim_rope=64, BF16
 
     # Allocate two separate output buffers (as uint8 for direct byte-level access)
-    nope_part_u8 = torch.empty(
+    # Zero the scale slot so G=1 pad bytes stay 0 (kernel only writes live scales).
+    nope_part_u8 = torch.zeros(
         (num_tokens, nope_part_bytes), dtype=torch.uint8, device=k_nope.device
     )
     rope_part_u8 = torch.empty(
@@ -300,7 +339,7 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
     )
 
     # Create typed views for the kernel to write into
-    # Fixed byte layout for nope_part: [nope_fp8 (dim_nope bytes) | scales_fp32 (num_tiles*4 bytes)]
+    # Fixed byte layout for nope_part: [nope_fp8 | scale_slot]
     # Fixed byte layout for rope_part: [rope_bf16 (dim_rope*2 bytes)]
     nope_q_view = nope_part_u8[:, :dim_nope].view(torch.float8_e4m3fn)
     nope_s_view = nope_part_u8[:, dim_nope:].view(torch.float32)

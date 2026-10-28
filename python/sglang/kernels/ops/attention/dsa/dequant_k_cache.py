@@ -4,9 +4,25 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsa.quant_k_cache import fp8_kv_scale_slot_bytes
+
 
 def _infer_dsa_dims(dim_quant: int, tile_size: int = 128) -> tuple[int, int]:
-    """Recover the NoPE and RoPE widths from a packed DSA cache row."""
+    """Recover the NoPE and RoPE widths from a packed DSA cache row.
+
+    Recognizes both G=4 (``tile_size=128`` → 4 scales) and G=1 padded
+    (``[512|fp32|12B pad]=528``) layouts. G=1 rows share the 528/656 widths
+    with G=4 when ``dim_nope=512``; callers pass ``group_size`` to select
+    dequant semantics.
+    """
+    # Prefer G=1 padded layout when the row matches 512 + 16 (+ rope).
+    for dim_rope in (0, 64):
+        rope_bytes = 2 * dim_rope
+        for dim_nope in (512, 256):
+            scale_slot = fp8_kv_scale_slot_bytes(dim_nope, dim_nope)  # G=1 slot
+            if dim_quant == dim_nope + scale_slot + rope_bytes:
+                return dim_nope, dim_rope
+
     for dim_rope in (0, 64):
         scaled_width = (dim_quant - 2 * dim_rope) * tile_size
         if scaled_width % (tile_size + 4):
@@ -17,29 +33,41 @@ def _infer_dsa_dims(dim_quant: int, tile_size: int = 128) -> tuple[int, int]:
     raise ValueError(f"Unsupported packed DSA KV row width: {dim_quant}")
 
 
-def dequantize_k_cache(quant_k_cache, dv: int | None = None):
-    return _dequantize_k_cache_fast_wrapped(quant_k_cache, dv=dv)
+def _scale_slot_bytes_for_row(dim_quant: int, dim_nope: int, dim_rope: int) -> int:
+    scale_slot = dim_quant - dim_nope - dim_rope * 2
+    if scale_slot < 4 or scale_slot % 4 != 0:
+        raise ValueError(
+            f"Invalid scale slot bytes={scale_slot} for packed row "
+            f"dim_quant={dim_quant} dim_nope={dim_nope} dim_rope={dim_rope}"
+        )
+    return scale_slot
+
+
+def dequantize_k_cache(quant_k_cache, dv: int | None = None, group_size: int = 128):
+    return _dequantize_k_cache_fast_wrapped(quant_k_cache, dv=dv, group_size=group_size)
 
 
 def _dequantize_k_cache_fast_wrapped(
     quant_k_cache: torch.Tensor,
     dv: int | None = None,
     tile_size: int = 128,
+    group_size: int = 128,
 ) -> torch.Tensor:
     original_ndim = quant_k_cache.ndim
     if original_ndim == 3:
         # set block_size = 1
         quant_k_cache = quant_k_cache.unsqueeze(1)
     num_blocks, block_size, _, dim_quant = quant_k_cache.shape
-    assert tile_size == 128
-    inferred_dv, dim_rope = _infer_dsa_dims(dim_quant)
+    inferred_dv, dim_rope = _infer_dsa_dims(dim_quant, tile_size=tile_size)
     if dv is None:
         dv = inferred_dv
     if dv != inferred_dv:
         raise ValueError(f"dv={dv} does not match packed row width {dim_quant}")
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
-    output = _dequantize_k_cache_fast(quant_k_cache, dim_nope=dv, dim_rope=dim_rope)
+    output = _dequantize_k_cache_fast(
+        quant_k_cache, dim_nope=dv, dim_rope=dim_rope, group_size=group_size
+    )
 
     if original_ndim == 3:
         return output.view(num_blocks, 1, -1)
@@ -56,8 +84,17 @@ def _dequantize_k_cache_fast(
     num_tokens, dim_quant = quant_k_cache.shape
 
     assert quant_k_cache.dtype == torch.float8_e4m3fn
+    if dim_nope % group_size != 0:
+        raise ValueError(
+            f"dim_nope={dim_nope} not divisible by group_size={group_size}"
+        )
     num_tiles = dim_nope // group_size
-    assert dim_quant == dim_nope + num_tiles * 4 + dim_rope * 2
+    scale_slot = _scale_slot_bytes_for_row(dim_quant, dim_nope, dim_rope)
+    if scale_slot < num_tiles * 4:
+        raise ValueError(
+            f"scale slot {scale_slot}B too small for {num_tiles} tiles "
+            f"(group_size={group_size})"
+        )
 
     output = torch.empty(
         (num_tokens, dim_nope + dim_rope),
@@ -67,13 +104,11 @@ def _dequantize_k_cache_fast(
 
     num_blocks_per_token = num_tiles + triton.cdiv(dim_rope, group_size)
 
-    assert dim_nope % group_size == 0
-
     input_nope_q = quant_k_cache[:, :dim_nope]
-    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
+    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + scale_slot].view(
         torch.float32
     )
-    input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+    input_rope = quant_k_cache[:, dim_nope + scale_slot :].view(torch.bfloat16)
 
     _dequantize_k_cache_fast_kernel[(num_tokens, num_blocks_per_token)](
         output,
@@ -151,6 +186,7 @@ def dequantize_k_cache_paged(
     Args:
         quant_k_cache: [total_num_tokens, 1, dim_quant] or [num_blocks, block_size, 1, dim_quant], the quantized k-cache in paged layout
         page_table_1_flattened: [num_tokens], the flattened page_table_1 with the page indices in each requests concatenated together
+        group_size: per-tile dequant width (``128`` = G=4, ``512`` = G=1)
     Returns:
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
@@ -162,7 +198,17 @@ def dequantize_k_cache_paged(
     # Index bounds validated in dsa_backend.init_forward_metadata
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
+    if dim_nope % group_size != 0:
+        raise ValueError(
+            f"dim_nope={dim_nope} not divisible by group_size={group_size}"
+        )
     num_tiles = dim_nope // group_size
+    scale_slot = _scale_slot_bytes_for_row(dim_quant, dim_nope, dim_rope)
+    if scale_slot < num_tiles * 4:
+        raise ValueError(
+            f"scale slot {scale_slot}B too small for {num_tiles} tiles "
+            f"(group_size={group_size})"
+        )
 
     output = torch.empty(
         (num_tokens, 1, dim_nope + dim_rope),
@@ -172,15 +218,12 @@ def dequantize_k_cache_paged(
 
     num_blocks_per_token = num_tiles + triton.cdiv(dim_rope, group_size)
 
-    assert dim_nope % group_size == 0
-
     input_nope_q = quant_k_cache[:, :dim_nope]
-    # [:, 512:512+4*4] = [:, 512:528]
-    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
+    # G=4: [:, 512:528]; G=1: [:, 512:528] with only first fp32 live
+    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + scale_slot].view(
         torch.float32
     )
-    # [:, 528:]
-    input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+    input_rope = quant_k_cache[:, dim_nope + scale_slot :].view(torch.bfloat16)
 
     _dequantize_k_cache_paged_kernel[(num_tokens, num_blocks_per_token)](
         output,
@@ -307,9 +350,18 @@ def gather_dequant_requant_fp8_paged(
 
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
+    if dim_nope % group_size != 0:
+        raise ValueError(
+            f"dim_nope={dim_nope} not divisible by group_size={group_size}"
+        )
     num_tiles = dim_nope // group_size
     out_dim = dim_nope + dim_rope
-    assert num_tiles * group_size == dim_nope
+    scale_slot = _scale_slot_bytes_for_row(dim_quant, dim_nope, dim_rope)
+    if scale_slot < num_tiles * 4:
+        raise ValueError(
+            f"scale slot {scale_slot}B too small for {num_tiles} tiles "
+            f"(group_size={group_size})"
+        )
 
     total_rows = num_tokens + extra_rows
     if out is None:
@@ -334,10 +386,10 @@ def gather_dequant_requant_fp8_paged(
         return output
 
     input_nope_q = quant_k_cache[:, :dim_nope]
-    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
+    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + scale_slot].view(
         torch.float32
     )
-    input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+    input_rope = quant_k_cache[:, dim_nope + scale_slot :].view(torch.bfloat16)
 
     grid = (triton.cdiv(total_rows, _GATHER_TOKENS_PER_PROG),)
     _gather_dequant_requant_fp8_paged_vec_kernel[grid](
@@ -461,9 +513,18 @@ def gather_dequant_requant_fp8_paged_legacy(
 
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
+    if dim_nope % group_size != 0:
+        raise ValueError(
+            f"dim_nope={dim_nope} not divisible by group_size={group_size}"
+        )
     num_tiles = dim_nope // group_size
     out_dim = dim_nope + dim_rope
-    assert num_tiles * group_size == dim_nope
+    scale_slot = _scale_slot_bytes_for_row(dim_quant, dim_nope, dim_rope)
+    if scale_slot < num_tiles * 4:
+        raise ValueError(
+            f"scale slot {scale_slot}B too small for {num_tiles} tiles "
+            f"(group_size={group_size})"
+        )
 
     total_rows = num_tokens + extra_rows
     # Allocate a fresh zero-filled buffer.  The extra landing-pad rows at
@@ -478,10 +539,10 @@ def gather_dequant_requant_fp8_paged_legacy(
     num_blocks_per_token = num_tiles + triton.cdiv(dim_rope, group_size)
 
     input_nope_q = quant_k_cache[:, :dim_nope]
-    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
+    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + scale_slot].view(
         torch.float32
     )
-    input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+    input_rope = quant_k_cache[:, dim_nope + scale_slot :].view(torch.bfloat16)
 
     _gather_dequant_requant_fp8_paged_kernel[(num_tokens, num_blocks_per_token)](
         output,

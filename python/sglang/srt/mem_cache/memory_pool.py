@@ -4042,6 +4042,10 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "quant_block_size", None)
 
     @property
+    def kv_fp8_quant_group_size(self) -> Optional[int]:
+        return getattr(self.full_kv_pool, "kv_fp8_quant_group_size", None)
+
+    @property
     def index_kpool(self) -> int:
         return getattr(self.full_kv_pool, "index_kpool", 1)
 
@@ -4434,6 +4438,20 @@ class MLATokenToKVPool(KVCache):
             if self.dsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
+        # FP8 NoPE quant tile: G=4 (128) by default; FlashInfer G=1 uses
+        # kv_lora_rank (typically 512) with a 16B padded scale slot.
+        self.kv_fp8_quant_group_size = 128
+        if self.dsa_kv_cache_store_fp8:
+            try:
+                from sglang.srt.layers.attention.dsa.utils import (
+                    uses_dsa_fp8_g1_packed_kv,
+                )
+
+                if uses_dsa_fp8_g1_packed_kv():
+                    self.kv_fp8_quant_group_size = kv_lora_rank
+            except Exception:
+                # Runtime context may be unavailable in unit-test pool construction.
+                pass
 
         self._create_buffers()
 
@@ -4593,12 +4611,15 @@ class MLATokenToKVPool(KVCache):
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
+            # tile_size: G=4 → 128; FlashInfer G=1 → kv_lora_rank (512) with 16B scale slot.
             cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
-                cache_k_nope, cache_k_rope
+                cache_k_nope,
+                cache_k_rope,
+                tile_size=int(getattr(self, "kv_fp8_quant_group_size", 128)),
             )
 
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
-            # NoPE bytes are [FP8 values | one FP32 scale per 128 values].
+            # NoPE bytes are [FP8 values | scale slot] (G=4: 4×fp32; G=1: 1×fp32+pad).
             # RoPE bytes contain the raw BF16 tail and may have zero width.
             self._scatter_mla_rows(dst_buffer, loc, cache_k_nope_fp8, cache_k_rope_fp8)
         else:

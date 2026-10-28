@@ -2582,27 +2582,16 @@ def calculate_mla_kv_cache_dim(
     if not is_dsa_model:
         return kv_cache_dim
 
-    # Backends that consume contiguous raw MLA KV (no packed per-block scales).
-    # Mirrors vLLM FLASHINFER_MLA_SPARSE_SM90 plain E4M3 ``[N, 1, 512/576]``.
+    from sglang.srt.layers.attention.dsa.utils import (
+        DSA_FP8_G1_SCALE_SLOT_BYTES,
+        uses_dsa_fp8_g1_packed_kv,
+        uses_raw_mla_fp8_kv,
+    )
+
+    # TRT-LLM consumes contiguous raw E4M3 MLA rows (no in-row scales).
     # In disaggregated serving only the backend for the local role determines
     # the local pool layout; the inactive role may differ.
-    _RAW_MLA_FP8_BACKENDS = ("trtllm", "flashinfer_mla_sparse")
-    disaggregation_mode = get_disagg().disaggregation_mode
-    if disaggregation_mode == "decode":
-        uses_raw_mla_kv_layout = (
-            get_exec().kernel.dsa_decode_backend in _RAW_MLA_FP8_BACKENDS
-        )
-    elif disaggregation_mode == "prefill":
-        uses_raw_mla_kv_layout = (
-            get_exec().kernel.dsa_prefill_backend in _RAW_MLA_FP8_BACKENDS
-        )
-    else:
-        uses_raw_mla_kv_layout = (
-            get_exec().kernel.dsa_prefill_backend in _RAW_MLA_FP8_BACKENDS
-            or get_exec().kernel.dsa_decode_backend in _RAW_MLA_FP8_BACKENDS
-        )
-
-    if uses_raw_mla_kv_layout:
+    if uses_raw_mla_fp8_kv():
         return kv_cache_dim
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
@@ -2615,15 +2604,23 @@ def calculate_mla_kv_cache_dim(
 
     quant_block_size = DSATokenToKVPool.quant_block_size
     rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
-    # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
-    # (excluding TRTLLM / flashinfer_mla_sparse and HIP raw-layout kernels).
-    # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
+    # FP8 packed layouts (FlashInfer G=1 or legacy G=4 / Type-B).
     # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
     if kv_cache_dtype == torch.float8_e4m3fn:
+        # flashinfer_mla_sparse: G=1 per-token scale with 16B scale slot
+        # ([512 e4m3 | fp32 | 12B pad] = 528, optional rope bf16 tail).
+        if uses_dsa_fp8_g1_packed_kv():
+            return (
+                kv_lora_rank
+                + DSA_FP8_G1_SCALE_SLOT_BYTES
+                + qk_rope_head_dim * rope_storage_dtype.itemsize
+            )
+
         assert kv_lora_rank % quant_block_size == 0, (
             f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
         )
 
+        # Legacy G=4 / Type-B: one fp32 scale per 128-d tile.
         return (
             kv_lora_rank
             + kv_lora_rank // quant_block_size * 4

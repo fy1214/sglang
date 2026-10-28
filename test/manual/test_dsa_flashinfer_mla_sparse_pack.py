@@ -105,8 +105,10 @@ class TestFp8KvRunScales(unittest.TestCase):
         runner = object.__new__(mod.DSAFlashInferMLASparseRunner)
         runner._planned_num_tokens = 1
         runner.use_fp8_kv_cache = True
+        runner.packed_fp8_kv = False
         runner.kv_lora_rank = 512
         runner.qk_rope_head_dim = 0
+        runner.packed_row_bytes = 528
         runner.wrapper = _FakeWrapper()
 
         q = torch.zeros(1, 2, 512, dtype=torch.bfloat16)
@@ -117,23 +119,59 @@ class TestFp8KvRunScales(unittest.TestCase):
         self.assertEqual(runner.wrapper.ckv_dtype, torch.float8_e4m3fn)
         self.assertEqual(runner.wrapper.kwargs, {"ckv_scale": 0.5, "kpe_scale": 1.0})
 
-    def test_run_rejects_packed_fp8_dim(self):
+    def test_run_packed_fp8_calls_run_packed_kv(self):
+        """G=1 packed 528B rows go through run_packed_kv (scale_offset=512)."""
         from sglang.srt.layers.attention.dsa import flashinfer_mla_sparse as mod
+
+        class _FakeWrapper:
+            def __init__(self):
+                self.packed_kwargs = None
+
+            def run_packed_kv(self, q_nope, q_pe, kv, *, scale_offset, out=None, **kw):
+                self.packed_kwargs = {
+                    "scale_offset": scale_offset,
+                    "kv_shape": tuple(kv.shape),
+                    "kv_dtype": kv.dtype,
+                }
+                return out if out is not None else q_nope
 
         runner = object.__new__(mod.DSAFlashInferMLASparseRunner)
         runner._planned_num_tokens = 1
         runner.use_fp8_kv_cache = True
+        runner.packed_fp8_kv = True
         runner.kv_lora_rank = 512
         runner.qk_rope_head_dim = 0
-        runner.wrapper = None
+        runner.packed_row_bytes = 528
+        runner.wrapper = _FakeWrapper()
 
         q = torch.zeros(1, 2, 512, dtype=torch.bfloat16)
         q_pe = torch.zeros(1, 2, 0, dtype=torch.bfloat16)
-        # Packed DSA NoPE FP8: 512 + 4*4 scale bytes = 528
         kv = torch.zeros(4, 1, 528, dtype=torch.uint8)
-        with self.assertRaises(ValueError) as ctx:
-            runner.run(q, q_pe, kv, 512, ckv_scale=1.0, kpe_scale=1.0)
-        self.assertIn("raw MLA KV layout", str(ctx.exception))
+        out = runner.run(q, q_pe, kv, 512)
+        self.assertEqual(out.shape, q.shape)
+        self.assertEqual(
+            runner.wrapper.packed_kwargs,
+            {
+                "scale_offset": 512,
+                "kv_shape": (4, 1, 528),
+                "kv_dtype": torch.float8_e4m3fn,
+            },
+        )
+
+
+class TestFp8G1QuantLayout(unittest.TestCase):
+    def test_g1_scale_slot_and_row_bytes(self):
+        from sglang.kernels.ops.attention.dsa.quant_k_cache import (
+            FP8_G1_SCALE_SLOT_BYTES,
+            fp8_kv_packed_row_bytes,
+            fp8_kv_scale_slot_bytes,
+        )
+
+        self.assertEqual(FP8_G1_SCALE_SLOT_BYTES, 16)
+        self.assertEqual(fp8_kv_scale_slot_bytes(512, 512), 16)
+        self.assertEqual(fp8_kv_scale_slot_bytes(512, 128), 16)
+        self.assertEqual(fp8_kv_packed_row_bytes(512, 0, 512), 528)
+        self.assertEqual(fp8_kv_packed_row_bytes(512, 0, 128), 528)
 
 
 if __name__ == "__main__":

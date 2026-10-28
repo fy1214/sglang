@@ -381,6 +381,11 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
+        # G=4 (128) vs FlashInfer G=1 (kv_lora_rank, typically 512).
+        self.kv_fp8_quant_group_size = int(
+            getattr(model_runner.token_to_kv_pool, "kv_fp8_quant_group_size", None)
+            or 128
+        )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         # kpool>1 keeps the CPU seq_lens mirror: the spec-v2 relay that feeds
@@ -597,16 +602,9 @@ class DeepseekSparseAttnBackend(
                     f"FA3 sparse; got compute capability sm_{self.device_sm_major}x "
                     "(use flashinfer_sparse_mla for SM120 packed sparse)."
                 )
-            # vLLM SM90 FP8 path needs plain E4M3 rows; packed DSA FP8 embeds
-            # per-block scales (528/656) and cannot feed BatchMLA FA3.
-            if self.dsa_kv_cache_store_fp8:
-                raise ValueError(
-                    "flashinfer_mla_sparse does not support packed DSA FP8 KV "
-                    "(override_kv_cache_dim with per-block scales). Select "
-                    "--dsa-prefill/decode-backend flashinfer_mla_sparse before "
-                    "KV pool allocation so calculate_mla_kv_cache_dim keeps the "
-                    "raw MLA dim (same as TRTLLM / vLLM FLASHINFER_MLA_SPARSE_SM90)."
-                )
+            # FP8 + flashinfer_mla_sparse uses G=1 packed rows
+            # ([512 e4m3 | fp32 | 12B pad] = 528) via run_packed_kv.
+            # BF16 / raw E4M3 still work (legacy per-tensor scale path).
             self.workspace_buffer = get_buffer(
                 "dsa_flashinfer_mla_sparse_workspace",
                 lambda: torch.empty(
@@ -656,6 +654,7 @@ class DeepseekSparseAttnBackend(
                 max_tokens=max_tokens,
                 topk_width=topk_width,
                 backend="fa3",
+                packed_fp8_kv=bool(self.dsa_kv_cache_store_fp8),
             )
         elif uses_flashinfer_sparse_mla:
             self.workspace_buffer = get_buffer(
@@ -2338,7 +2337,9 @@ class DeepseekSparseAttnBackend(
                     )
                     assert page_table_1_flattened is not None
                     kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
+                        kv_cache,
+                        page_table_1_flattened,
+                        group_size=self.kv_fp8_quant_group_size,
                     )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
@@ -3004,6 +3005,7 @@ class DeepseekSparseAttnBackend(
             kv_padded = gather_dequant_requant_fp8_paged(
                 paged_kv_cache,
                 page_table_1_flattened,
+                group_size=self.kv_fp8_quant_group_size,
                 extra_rows=topk,
                 out=kv_buf[:total_kv_rows],
             ).view(-1, 1, head_dim)
@@ -3212,7 +3214,8 @@ class DeepseekSparseAttnBackend(
         Same wrapper as dense ``flashinfer_mla_backend``, DSA topk page_table
         like vLLM ``FLASHINFER_MLA_SPARSE_SM90``. Supports kpool tails via wider
         page table + ``compute_dsa_seqlens`` (GLM NoPE: ``q_rope`` may be empty).
-        FP8 KV: raw E4M3 + ``layer.k_scale_float`` as ``ckv_scale`` (kpe_scale=1).
+        FP8 KV: G=1 packed rows via ``run_packed_kv`` (in-row scale); raw E4M3
+        falls back to per-tensor ``layer.k_scale_float``.
         """
         runner = self._flashinfer_mla_sparse_runner
         assert runner is not None, "flashinfer_mla_sparse runner was not initialized"
@@ -3261,16 +3264,23 @@ class DeepseekSparseAttnBackend(
         _ = sm_scale
 
         runner.pack_indices(page_table_1)
+        # G=1 packed: in-row scale via run_packed_kv (no per-tensor ckv_scale).
         ckv_scale = None
-        if runner.use_fp8_kv_cache and layer is not None:
+        kpe_scale = None
+        if (
+            runner.use_fp8_kv_cache
+            and not getattr(runner, "packed_fp8_kv", False)
+            and layer is not None
+        ):
             ckv_scale = float(getattr(layer, "k_scale_float", None) or 1.0)
+            kpe_scale = 1.0
         return runner.run(
             q_nope,
             q_pe,
             kv_cache,
             v_head_dim,
             ckv_scale=ckv_scale,
-            kpe_scale=1.0 if runner.use_fp8_kv_cache else None,
+            kpe_scale=kpe_scale,
         )
 
     def _forward_flashmla_kv(

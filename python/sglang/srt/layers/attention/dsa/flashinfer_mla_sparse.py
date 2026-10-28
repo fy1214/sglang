@@ -5,9 +5,12 @@ Mirrors vLLM ``FLASHINFER_MLA_SPARSE_SM90``:
 - ``page_size=1`` top-k slots are the page table; ``causal=False``
 - ``plan()`` runs outside CUDA-graph capture (metadata build / replay)
 - ``pack_indices()`` + ``run()`` are capture-safe and update reserved buffers
-- FP8 KV: plain contiguous E4M3 (uint8 storage / float8 view) + per-tensor
-  ``ckv_scale`` / ``kpe_scale`` (same as vLLM ``forward_mqa``); not the packed
-  DSA 528/656B scaled layout
+- FP8 KV:
+  - **G=1 packed** (preferred for DSA): row
+    ``[kv_lora e4m3 | fp32 scale | 12B pad]`` (=528 for 512-d NoPE) fed via
+    ``run_packed_kv`` (zero-copy in-row scale; no contiguous scale gather).
+  - **raw E4M3** (legacy / vLLM-style): last dim ``kv_lora(+rope)`` +
+    per-tensor ``ckv_scale`` / ``kpe_scale``.
 - Distinct from SM120 ``flashinfer_sparse_mla``
 """
 
@@ -28,6 +31,9 @@ except ImportError:  # pragma: no cover
     _TRITON_AVAILABLE = False
 
 _FP8_KV_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+# G=1 packed scale slot: 4B live fp32 + 12B pad (16B aligned).
+_G1_SCALE_SLOT_BYTES = 16
 
 
 def normalize_batch_mla_kv_dtype(kv_dtype: torch.dtype) -> torch.dtype:
@@ -103,6 +109,7 @@ class DSAFlashInferMLASparseRunner:
         max_tokens: int,
         topk_width: int,
         backend: str = "fa3",
+        packed_fp8_kv: bool = False,
     ) -> None:
         from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
@@ -121,9 +128,16 @@ class DSAFlashInferMLASparseRunner:
         # plan()/run() need logical E4M3; pool may store uint8 (vLLM #55222).
         self.kv_dtype = normalize_batch_mla_kv_dtype(kv_dtype)
         self.use_fp8_kv_cache = self.kv_dtype in _FP8_KV_DTYPES
+        self.packed_fp8_kv = bool(packed_fp8_kv) and self.use_fp8_kv_cache
         self.backend = backend
         self.max_tokens = max_tokens
         self.topk_width = topk_width
+        # G=1 packed row width: nope + 16B scale slot (+ rope bf16 bytes if any).
+        self.packed_row_bytes = (
+            kv_lora_rank
+            + _G1_SCALE_SLOT_BYTES
+            + qk_rope_head_dim * 2  # rope stored bf16 in DSA pool
+        )
 
         # Capture-stable device buffers (plan() refreshes via copy_).
         self.kv_indices = torch.zeros(
@@ -199,6 +213,7 @@ class DSAFlashInferMLASparseRunner:
             max_tokens=new_tokens,
             topk_width=new_width,
             backend=self.backend,
+            packed_fp8_kv=self.packed_fp8_kv,
         )
         self._capacity_frozen = frozen
 
@@ -337,9 +352,11 @@ class DSAFlashInferMLASparseRunner:
     ) -> torch.Tensor:
         """Run BatchMLA using the planned reserved buffers (no plan here).
 
-        FP8 KV mirrors vLLM ``FlashInferMLASparseSM90Impl.forward_mqa``:
-        view storage as ``float8_e4m3fn`` and pass per-tensor scales into
-        FA3 in-kernel dequant (Q stays BF16).
+        FP8 KV:
+        - G=1 packed rows → ``run_packed_kv`` (in-row scale at offset
+          ``kv_lora_rank``; no contiguous scale gather).
+        - raw E4M3 rows → view + per-tensor ``ckv_scale`` / ``kpe_scale``
+          (vLLM ``forward_mqa`` style).
         """
         if self._planned_num_tokens < 0:
             raise RuntimeError("flashinfer_mla_sparse run() called before plan()")
@@ -349,6 +366,9 @@ class DSAFlashInferMLASparseRunner:
             flat = kv_cache.unsqueeze(1)
         else:
             flat = kv_cache
+
+        if out is None:
+            out = q_nope.new_empty(q_nope.shape)
 
         if self.use_fp8_kv_cache or flat.dtype in (
             torch.uint8,
@@ -362,15 +382,37 @@ class DSAFlashInferMLASparseRunner:
                     "flashinfer_mla_sparse FP8 path expected uint8/float8_e4m3 "
                     f"KV cache, got dtype={flat.dtype}"
                 )
-            expected_dim = self.kv_lora_rank + self.qk_rope_head_dim
-            if flat.shape[-1] != expected_dim:
+
+            last_dim = flat.shape[-1]
+            raw_dim = self.kv_lora_rank + self.qk_rope_head_dim
+            packed_dim = self.packed_row_bytes
+
+            if last_dim == packed_dim or self.packed_fp8_kv:
+                return self._run_packed_fp8(q_nope, q_pe, flat, out=out)
+
+            if last_dim != raw_dim:
                 raise ValueError(
-                    "flashinfer_mla_sparse FP8 requires raw MLA KV layout "
-                    f"(last dim={expected_dim}=kv_lora+rope); got "
-                    f"last dim={flat.shape[-1]}. Packed DSA FP8 (528/656) is "
-                    "unsupported — select flashinfer_mla_sparse before pool "
-                    "alloc so calculate_mla_kv_cache_dim returns the raw dim."
+                    "flashinfer_mla_sparse FP8 expected raw MLA dim "
+                    f"{raw_dim} or G=1 packed dim {packed_dim}; got "
+                    f"last dim={last_dim}."
                 )
+
+            ckv = flat[..., :v_head_dim]
+            kpe = flat[..., v_head_dim:]
+            if self.qk_rope_head_dim == 0:
+                kpe = flat.new_empty(*flat.shape[:-1], 0)
+                if q_pe.shape[-1] == 0:
+                    q_pe = q_nope.new_empty(q_nope.shape[0], q_nope.shape[1], 0)
+
+            return self.wrapper.run(
+                q_nope,
+                q_pe,
+                ckv,
+                kpe,
+                out=out,
+                ckv_scale=float(1.0 if ckv_scale is None else ckv_scale),
+                kpe_scale=float(1.0 if kpe_scale is None else kpe_scale),
+            )
 
         ckv = flat[..., :v_head_dim]
         kpe = flat[..., v_head_dim:]
@@ -379,13 +421,50 @@ class DSAFlashInferMLASparseRunner:
             if q_pe.shape[-1] == 0:
                 q_pe = q_nope.new_empty(q_nope.shape[0], q_nope.shape[1], 0)
 
-        if out is None:
-            out = q_nope.new_empty(q_nope.shape)
+        return self.wrapper.run(q_nope, q_pe, ckv, kpe, out=out)
 
-        scale_kwargs = {}
-        if self.use_fp8_kv_cache or ckv.dtype in _FP8_KV_DTYPES:
-            scale_kwargs = {
-                "ckv_scale": float(1.0 if ckv_scale is None else ckv_scale),
-                "kpe_scale": float(1.0 if kpe_scale is None else kpe_scale),
-            }
-        return self.wrapper.run(q_nope, q_pe, ckv, kpe, out=out, **scale_kwargs)
+    def _run_packed_fp8(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        flat: torch.Tensor,
+        *,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """G=1 packed path: zero-copy in-row scale via ``run_packed_kv``."""
+        if flat.shape[-1] != self.packed_row_bytes:
+            raise ValueError(
+                "flashinfer_mla_sparse G=1 packed FP8 expected last dim "
+                f"{self.packed_row_bytes} "
+                f"(=kv_lora {self.kv_lora_rank} + 16B scale slot"
+                f"{'' if self.qk_rope_head_dim == 0 else f' + rope*{self.qk_rope_head_dim}*2'}); "
+                f"got {flat.shape[-1]}."
+            )
+        if not hasattr(self.wrapper, "run_packed_kv"):
+            raise RuntimeError(
+                "flashinfer_mla_sparse G=1 packed FP8 requires FlashInfer "
+                "BatchMLAPagedAttentionWrapper.run_packed_kv "
+                "(glm5.3-flash / squack G=1 build)."
+            )
+
+        # Rope stays BF16 in the DSA pool tail; FlashInfer G=1 kpe expects FP8
+        # sharing the same per-token scale. GLM-5.3-Flash DSA is NoPE
+        # (qk_rope_head_dim=0). Fail closed if rope is present until a FP8
+        # rope-tail store path exists.
+        if self.qk_rope_head_dim != 0:
+            raise NotImplementedError(
+                "flashinfer_mla_sparse G=1 packed FP8 currently supports "
+                "NoPE only (qk_rope_head_dim=0). Rope bf16 tail in the packed "
+                "row is not yet re-quantized for run_packed_kv."
+            )
+
+        if q_pe.shape[-1] == 0:
+            q_pe = q_nope.new_empty(q_nope.shape[0], q_nope.shape[1], 0)
+
+        return self.wrapper.run_packed_kv(
+            q_nope,
+            q_pe,
+            flat,
+            scale_offset=self.kv_lora_rank,
+            out=out,
+        )

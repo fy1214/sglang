@@ -103,10 +103,14 @@ class SWAKVPool(BaseSWAKVPool):
         )
         self.dsa_kv_cache_store_fp8 = False
         self.kv_cache_dim = None
+        self.kv_fp8_quant_group_size = None
         self.index_head_dim = None
         if isinstance(self.full_kv_pool, MLATokenToKVPool):
             self.dsa_kv_cache_store_fp8 = self.full_kv_pool.dsa_kv_cache_store_fp8
             self.kv_cache_dim = self.full_kv_pool.kv_cache_dim
+            self.kv_fp8_quant_group_size = getattr(
+                self.full_kv_pool, "kv_fp8_quant_group_size", None
+            )
         if isinstance(self.full_kv_pool, DSATokenToKVPool):
             self.index_head_dim = self.full_kv_pool.index_head_dim
         # {layer_id: (index, is_swa_layer)}

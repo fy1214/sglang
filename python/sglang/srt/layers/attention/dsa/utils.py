@@ -242,6 +242,40 @@ def maybe_prefetch_next_full_attention_kv(
         prefetch_kv_buffer(next_full_attention_layer_id)
 
 
+# DSA FP8 KV layouts selected by the local role's attention backend.
+# flashinfer_mla_sparse consumes G=1 packed rows
+# ([512 e4m3 | fp32 scale | 12B pad] = 528, optional rope bf16 tail).
+# trtllm keeps contiguous raw E4M3 (no in-row scales).
+_DSA_FP8_G1_PACKED_BACKENDS = ("flashinfer_mla_sparse",)
+_DSA_RAW_MLA_FP8_BACKENDS = ("trtllm",)
+# Scale slot bytes for G=1 (4B live scale + 12B pad).
+DSA_FP8_G1_SCALE_SLOT_BYTES = 16
+
+
+def local_dsa_attn_backends() -> tuple[str, ...]:
+    """Prefill/decode DSA backends that own the local KV pool layout."""
+    from sglang.srt.runtime_context import get_disagg, get_exec
+
+    mode = get_disagg().disaggregation_mode
+    prefill = get_exec().kernel.dsa_prefill_backend
+    decode = get_exec().kernel.dsa_decode_backend
+    if mode == "decode":
+        return (decode,)
+    if mode == "prefill":
+        return (prefill,)
+    return (prefill, decode)
+
+
+def uses_dsa_fp8_g1_packed_kv() -> bool:
+    """True when local DSA backends store FlashInfer G=1 packed FP8 KV rows."""
+    return any(b in _DSA_FP8_G1_PACKED_BACKENDS for b in local_dsa_attn_backends())
+
+
+def uses_raw_mla_fp8_kv() -> bool:
+    """True when local DSA backends need contiguous raw E4M3 MLA rows."""
+    return any(b in _DSA_RAW_MLA_FP8_BACKENDS for b in local_dsa_attn_backends())
+
+
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
