@@ -1411,6 +1411,9 @@ def chunk_kda(
     beta = beta[:, :num_tokens]
     if beta_is_raw:
         beta = beta.float().sigmoid()
+    cu_seqlens_cpu = kwargs.get("cu_seqlens_cpu")
+    if cu_seqlens_cpu is None:
+        cu_seqlens_cpu = kwargs.get("query_start_loc_cpu")
     if num_tokens == 1:
         # Tracing constant-folds size-one dimensions, but the resulting kernel
         # can share a cache entry with longer inputs. Keep T=1 on Triton so a
@@ -1426,6 +1429,7 @@ def chunk_kda(
             initial_state_indices=initial_state_indices,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
@@ -1442,7 +1446,7 @@ def chunk_kda(
     g = g.contiguous()
     beta = beta.contiguous()
     chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
+        prepare_chunk_indices(cu_seqlens, CHUNK_SIZE, cu_seqlens_cpu=cu_seqlens_cpu)
         if cu_seqlens is not None
         else None
     )

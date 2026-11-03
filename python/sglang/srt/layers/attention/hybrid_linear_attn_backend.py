@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -155,6 +156,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_end_locs = None
         track_ssm_recompute_dst = None
         logical_num_tokens = None
+        query_start_loc_cpu = None
         track_mask_indices = None
 
         # Padded rows carry req-pool row 0, which maps to the reserved mamba
@@ -291,6 +293,10 @@ class MambaAttnBackendBase(AttentionBackend):
                     and forward_batch.tbo_parent_token_range is None
                 ):
                     logical_num_tokens = sum(forward_batch.extend_seq_lens_cpu)
+                    query_start_loc_cpu = torch.tensor(
+                        [0, *itertools.accumulate(forward_batch.extend_seq_lens_cpu)],
+                        dtype=torch.int32,
+                    )
                 else:
                     logical_num_tokens = int(query_start_loc[-1])
                 if has_mamba_track_mask:
@@ -315,6 +321,7 @@ class MambaAttnBackendBase(AttentionBackend):
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             logical_num_tokens=logical_num_tokens,
+            query_start_loc_cpu=query_start_loc_cpu,
             mamba_track_mask_indices=track_mask_indices,
             mamba_cache_indices=mamba_cache_indices,
             # Physical track destinations (None when tracking off); cuda-graph

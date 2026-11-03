@@ -146,7 +146,10 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         metadata = forward_batch.attn_cp_metadata
         if metadata.moe_local_token_count is None:
             lengths = metadata.per_rank_logical_token or metadata.per_rank_actual_token
-            metadata.moe_local_token_count = torch.tensor(
+            # torch.full keeps the Python scalar as a kernel arg (no pageable
+            # H2D). torch.tensor(..., device=cuda) would sync the stream.
+            metadata.moe_local_token_count = torch.full(
+                (),
                 lengths[self.cp_rank],
                 dtype=torch.int32,
                 device=forward_batch.input_ids.device,

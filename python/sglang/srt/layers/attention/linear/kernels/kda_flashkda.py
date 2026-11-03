@@ -43,6 +43,7 @@ def _triton_fallback(
     return_intermediate_states=False,
     track_state=None,
     track_chunk_idx=None,
+    cu_seqlens_cpu=None,
 ):
     """Fall back to the Triton chunk_kda kernel (handles all preprocessing).
 
@@ -64,6 +65,7 @@ def _triton_fallback(
         initial_state_indices=cache_indices,
         use_qk_l2norm_in_kernel=True,
         cu_seqlens=query_start_loc,
+        cu_seqlens_cpu=cu_seqlens_cpu,
         A_log=A_log,
         dt_bias=dt_bias,
         lower_bound=lower_bound,
@@ -151,6 +153,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 return_intermediate_states=return_intermediate_states,
                 track_state=kwargs.get("track_state"),
                 track_chunk_idx=kwargs.get("track_chunk_idx"),
+                cu_seqlens_cpu=kwargs.get("query_start_loc_cpu"),
             )
 
         return (

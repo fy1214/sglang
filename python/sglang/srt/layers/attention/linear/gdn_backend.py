@@ -1116,6 +1116,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
                 output=kwargs.get("linear_attn_output"),
+                query_start_loc_cpu=forward_metadata.query_start_loc_cpu,
             )
 
             if is_npu() and last_recurrent_state is not None:
@@ -1266,6 +1267,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             cache_indices=ssm_cache_indices,
             query_start_loc=query_start_loc,
             inplace_update=inplace_update,
+            query_start_loc_cpu=getattr(
+                self.forward_metadata, "query_start_loc_cpu", None
+            ),
         )
         return output
 
