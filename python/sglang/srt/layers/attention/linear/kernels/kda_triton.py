@@ -244,6 +244,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
             initial_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=query_start_loc,
+            # Host offsets spare prepare_chunk_indices reading cu_seqlens back.
+            cu_seqlens_cpu=kwargs.get("query_start_loc_cpu"),
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,

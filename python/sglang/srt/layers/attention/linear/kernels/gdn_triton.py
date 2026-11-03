@@ -200,6 +200,10 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
 
+        host_args = {}
+        if not is_cpu() and not is_npu():
+            # Host offsets spare prepare_chunk_indices reading cu_seqlens back.
+            host_args = {"cu_seqlens_cpu": kwargs.get("query_start_loc_cpu")}
         return chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -212,6 +216,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             **recurrent_state_indices_args,
             **inplace_update_args,
+            **host_args,
         )
 
     def target_verify(

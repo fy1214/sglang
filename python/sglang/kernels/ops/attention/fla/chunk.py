@@ -103,6 +103,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
         inplace_update: bool = True,
+        cu_seqlens_cpu: Optional[torch.LongTensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -112,7 +113,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             k = l2norm_fwd(k)
 
         chunk_indices = (
-            prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
+            prepare_chunk_indices(cu_seqlens, CHUNK_SIZE, cu_seqlens_cpu=cu_seqlens_cpu)
             if cu_seqlens is not None
             else None
         )
@@ -146,6 +147,7 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     inplace_update: bool = True,
+    cu_seqlens_cpu: Optional[torch.LongTensor] = None,
 ):
     r"""
     Args:
@@ -263,6 +265,7 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         inplace_update,
+        cu_seqlens_cpu,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

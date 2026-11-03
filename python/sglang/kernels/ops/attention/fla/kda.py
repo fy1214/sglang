@@ -1142,12 +1142,13 @@ def chunk_kda_fwd(
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
     beta_is_raw: bool = False,
+    cu_seqlens_cpu: Optional[torch.LongTensor] = None,
 ):
     chunk_size = 64
     # Pre-compute chunk indices once and thread through all downstream kernels.
     # Without this, each of the 4 callees would recompute independently.
     chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
+        prepare_chunk_indices(cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu)
         if cu_seqlens is not None
         else None
     )
@@ -1268,6 +1269,7 @@ def chunk_kda(
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
     beta_is_raw: bool = False,
+    cu_seqlens_cpu: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
     if scale is None:
@@ -1295,4 +1297,7 @@ def chunk_kda(
         track_state=track_state,
         track_chunk_idx=track_chunk_idx,
         beta_is_raw=beta_is_raw,
+        cu_seqlens_cpu=cu_seqlens_cpu
+        if cu_seqlens_cpu is not None
+        else kwargs.get("query_start_loc_cpu"),
     )

@@ -30,6 +30,9 @@ class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
     logical_num_tokens: Optional[int] = None
+    # Host twin of query_start_loc when extend lengths are trusted. Lets FLA
+    # prepare_chunk_indices skip the device .tolist() sync. None otherwise.
+    query_start_loc_cpu: Optional[torch.Tensor] = None
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
     # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
     # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated
