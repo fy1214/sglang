@@ -31,6 +31,7 @@ class FlashMLASchedMeta:
         topk: Optional[int]
         extra_page_block_size: Optional[int]
         extra_topk: Optional[int]
+        disable_split_kv: bool = False
 
     have_initialized: bool = False
     config: Optional[Config] = None
@@ -103,6 +104,7 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    disable_split_kv: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -147,6 +149,7 @@ def flash_mla_with_kvcache(
             extra_indices_in_kvcache=extra_indices_in_kvcache,
             topk_length=topk_length,
             extra_topk_length=extra_topk_length,
+            disable_split_kv=disable_split_kv,
         )
 
     assert num_splits is not None
@@ -195,6 +198,7 @@ def flash_mla_with_kvcache(
             extra_indices_in_kvcache,
             topk_length,
             extra_topk_length,
+            disable_split_kv,
         )
     return out, softmax_lse
 
@@ -216,6 +220,7 @@ def _flash_mla_with_kvcache_sched_meta(
     extra_indices_in_kvcache: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
+    disable_split_kv: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert num_splits is None, "num_splits must be None with FlashMLASchedMeta"
 
@@ -242,6 +247,7 @@ def _flash_mla_with_kvcache_sched_meta(
             topk=topk,
             extra_page_block_size=extra_page_block_size,
             extra_topk=extra_topk,
+            disable_split_kv=disable_split_kv,
         )
     else:
         helper_msg = (
@@ -261,6 +267,7 @@ def _flash_mla_with_kvcache_sched_meta(
             helper_msg
         )
         assert sched_meta.config.extra_topk == extra_topk, helper_msg
+        assert sched_meta.config.disable_split_kv == disable_split_kv, helper_msg
 
     if topk is not None:
         assert not causal, "causal must be False when sparse attention is enabled"
@@ -279,6 +286,7 @@ def _flash_mla_with_kvcache_sched_meta(
                 extra_topk_length,
                 head_dim_v,
                 softmax_scale,
+                disable_split_kv,
             )
         )
     else:

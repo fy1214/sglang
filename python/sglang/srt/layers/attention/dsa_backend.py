@@ -2393,6 +2393,9 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                # Prefill only (phase already treats target_verify /
+                # draft_extend_v2 as "decode"). Decode keeps split-KV.
+                disable_split_kv=(phase == "prefill"),
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -2580,6 +2583,8 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                # Decode keeps split-KV (default).
+                disable_split_kv=False,
             )
         elif dsa_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -3282,6 +3287,7 @@ class DeepseekSparseAttnBackend(
         layer,
         metadata: DSAMetadata,
         page_table_1,
+        disable_split_kv: bool = False,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
@@ -3308,10 +3314,26 @@ class DeepseekSparseAttnBackend(
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
+        # FlashMLA sparse-decode requires indices last dim == metadata topk,
+        # and topk % TOPK_BLOCK_SIZE (==64) == 0. KPool widens by (kpool-1)
+        # live tail cols; pad with -1 like tilelang.
+        topk_width = self._flashmla_kv_topk_width()
+        pad = topk_width - page_table_1.shape[-1]
+        if pad < 0:
+            raise RuntimeError(
+                f"FlashMLA decode page_table width {page_table_1.shape[-1]} "
+                f"> padded topk_width {topk_width} (topk={self.dsa_index_topk}, "
+                f"kpool={self.dsa_index_kpool})"
+            )
+        if pad:
+            page_table_1 = torch.cat(
+                (
+                    page_table_1,
+                    page_table_1.new_full((*page_table_1.shape[:-1], pad), -1),
+                ),
+                dim=-1,
+            )
         indices = page_table_1.unsqueeze(1)
-        assert (
-            indices.shape[-1] == self.dsa_index_topk
-        )  # requirement of FlashMLA decode kernel
 
         o, _ = flash_mla_with_kvcache(
             q=q_input,
@@ -3327,6 +3349,9 @@ class DeepseekSparseAttnBackend(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
             is_fp8_kvcache=True,
+            # Prefill-only: sm90 CTA writes out/lse directly (no split accum/combine).
+            # When True, FlashMLA ignores the provided tile/num_splits metadata.
+            disable_split_kv=disable_split_kv,
         )
 
         if target_q_heads != num_q_heads:
@@ -4039,10 +4064,23 @@ class DeepseekSparseAttnBackend(
             force_unfused_topk=force_unfused,
         )
 
+    def _flashmla_kv_topk_width(self) -> int:
+        """Indices width for flashmla_kv: kpool tail + pad to TOPK_BLOCK_SIZE=64."""
+        topk_width = int(self.dsa_index_topk or 1)
+        if self.dsa_index_kpool > 1:
+            topk_width += int(self.dsa_index_kpool) - 1
+        # FlashMLA SM90 sparse decode: params.topk % TOPK_BLOCK_SIZE == 0.
+        block = 64
+        rem = topk_width % block
+        if rem:
+            topk_width += block - rem
+        return topk_width
+
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
         from sgl_kernel.flash_mla import get_mla_metadata
 
         num_heads_q = self.flashmla_kv_num_q_heads
+        topk_width = self._flashmla_kv_topk_width()
 
         flashmla_metadata, num_splits = get_mla_metadata(
             cache_seqlens=cache_seqlens,
@@ -4052,7 +4090,7 @@ class DeepseekSparseAttnBackend(
             num_heads_k=1,
             num_heads_q=num_heads_q,
             is_fp8_kvcache=True,
-            topk=self.dsa_index_topk,
+            topk=topk_width,
         )
 
         return DSAFlashMLAMetadata(

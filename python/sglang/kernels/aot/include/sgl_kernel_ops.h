@@ -741,7 +741,8 @@ std::vector<at::Tensor> fwd_kvcache_mla(
     const std::optional<at::Tensor>& extra_k_cache,
     const std::optional<at::Tensor>& extra_indices_in_kvcache,
     const std::optional<at::Tensor>& topk_length,
-    const std::optional<at::Tensor>& extra_topk_length);
+    const std::optional<at::Tensor>& extra_topk_length,
+    bool disable_split_kv = false);
 
 void FMHACutlassSM100FwdRun(
     at::Tensor workspace_buffer,

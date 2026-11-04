@@ -44,7 +44,8 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::
     const std::optional<at::Tensor>& extra_topk_length,
     int d_v,
     float sm_scale,
-    const std::optional<std::string>& kv_format);
+    const std::optional<std::string>& kv_format,
+    bool disable_split_kv);
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_sparse_decode_fwd(
     const at::Tensor& q,
@@ -58,7 +59,8 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
     const std::optional<at::Tensor>& extra_indices,
     const std::optional<at::Tensor>& extra_topk_length,
     int64_t d_v,
-    double sm_scale) {
+    double sm_scale,
+    bool disable_split_kv) {
   return sparse_attn_decode_interface(
       q,
       kv,
@@ -72,7 +74,8 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       extra_topk_length,
       static_cast<int>(d_v),
       static_cast<float>(sm_scale),
-      std::nullopt);
+      std::nullopt,
+      disable_split_kv);
 }
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_dense_decode_fwd(
@@ -113,7 +116,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fwd_kvcache_mla(Tensor q, Tensor kv_cache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "
       "softmax_scale, bool is_causal, Tensor tile_scheduler_metadata, Tensor num_splits, bool is_fp8, Tensor? indices, "
       "Tensor? attn_sink, Tensor? extra_k_cache, Tensor? extra_indices_in_kvcache, Tensor? topk_length, Tensor? "
-      "extra_topk_length) "
+      "extra_topk_length, bool disable_split_kv=False) "
       "-> Tensor[]");
   m.impl("fwd_kvcache_mla", torch::kCUDA, &fwd_kvcache_mla);
 
@@ -128,7 +131,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "sparse_decode_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, "
       "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
-      "Tensor? extra_topk_length, int d_v, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
+      "Tensor? extra_topk_length, int d_v, float sm_scale, bool disable_split_kv=False) -> (Tensor, Tensor, Tensor?, "
+      "Tensor?)");
   m.impl("sparse_decode_fwd", torch::kCUDA, &sgl_sparse_decode_fwd);
 
   m.def(
