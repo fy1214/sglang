@@ -112,8 +112,13 @@ def prepare_kv_for_attention(
     k_pe: torch.Tensor,
     *,
     defer_materialization: bool,
+    stream=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Materialize KV needed before attention for the active layout."""
+    """Materialize KV needed before attention for the active layout.
+
+    ``stream`` is forwarded to the CP strategy so MLA latent all-gather can
+    run on an alternate CUDA stream (NCCL follows the current stream).
+    """
     if (
         defer_materialization
         or not dsa_use_prefill_cp(forward_batch)
@@ -127,6 +132,7 @@ def prepare_kv_for_attention(
         attn_mla.attn_mqa,
         k_nope,
         k_pe,
+        stream=stream,
     )
 
 

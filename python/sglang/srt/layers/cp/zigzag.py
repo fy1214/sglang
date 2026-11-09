@@ -326,13 +326,20 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def gather_kv_cache(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
-        gathered = self._all_gather_reorganized(x, forward_batch)
-        chunks = torch.split(
-            gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
-        )
-        return torch.cat(
-            [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
-        )
+        def _impl():
+            gathered = self._all_gather_reorganized(x, forward_batch)
+            chunks = torch.split(
+                gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
+            )
+            return torch.cat(
+                [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index],
+                dim=0,
+            )
+
+        if stream is not None and getattr(x, "is_cuda", False):
+            with torch.cuda.stream(stream):
+                return _impl()
+        return _impl()
 
     def local_q_indices(self, num_tokens: int, forward_batch) -> Any:
         meta = forward_batch.attn_cp_metadata
@@ -445,11 +452,16 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         )
 
     def materialize_full_mla_kv(
-        self, forward_batch, layer: Any, k_nope: Any, k_rope: Any
+        self,
+        forward_batch,
+        layer: Any,
+        k_nope: Any,
+        k_rope: Any,
+        stream: Optional[Any] = None,
     ) -> None:
         kv_lora_rank = k_nope.shape[-1]
         latent = torch.cat([k_nope, k_rope], dim=-1).contiguous()
-        latent_full = self.gather_kv_cache(latent, forward_batch)
+        latent_full = self.gather_kv_cache(latent, forward_batch, stream=stream)
         get_token_to_kv_pool().set_mla_kv_buffer(
             layer,
             forward_batch.out_cache_loc,

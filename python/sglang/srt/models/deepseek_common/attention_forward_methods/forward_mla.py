@@ -16,6 +16,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
 from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
+from sglang.srt.layers.cp.mla_gather_overlap import (
+    clear_cp_mla_gather_overlap,
+    maybe_install_cp_mla_gather_overlap,
+)
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -441,6 +445,26 @@ class DeepseekMLAForwardMixin:
                             )
                         self._q8kv8_qprep_overlap_pending = True
 
+                # Prefill-CP: stash pre-rope pe so that after compression-input
+                # gather we can start MLA latent KV gather on alt_stream under
+                # compress→topk. Skip when Q8KV8 already owns alt_stream or
+                # born-fp8 will re-rope/cast.
+                if (
+                    q_lora is not None
+                    and not self._q8kv8_qprep_overlap_pending
+                    and not _ENABLE_DSA_Q8KV8_BORN_FP8_Q
+                ):
+                    if q_pe is None or k_pe is None:
+                        q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+                    maybe_install_cp_mla_gather_overlap(
+                        self,
+                        forward_batch,
+                        k_nope,
+                        k_pe,
+                        q_pe,
+                        positions,
+                    )
+
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):
                         topk_indices = self.indexer(
@@ -577,52 +601,65 @@ class DeepseekMLAForwardMixin:
             elif is_kv_b_lora_active(self):
                 q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
+        # Prefill-CP MLA latent KV gather may still be running on alt_stream
+        # (started after compression-input gather). Q absorb above can overlap
+        # its tail; join before rope/KV consumers. Singleton alt_stream must
+        # be free before the next layer.
+        overlap_state = getattr(forward_batch, "cp_mla_gather_overlap", None)
+        overlap_done = bool(overlap_state is not None and overlap_state.launched)
+
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
-        if (
-            self.rotary_emb is not None
-            and not fuse_rope_for_trtllm_mla
-            # Already applied at the q-prep/indexer overlap fork.
-            and not self._q8kv8_qprep_overlap_pending
-        ):
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        if overlap_done:
+            k_nope, k_pe, q_pe, _roped = overlap_state.wait_and_take()
+            clear_cp_mla_gather_overlap(forward_batch)
+        else:
+            if overlap_state is not None:
+                clear_cp_mla_gather_overlap(forward_batch)
+            if (
+                self.rotary_emb is not None
+                and not fuse_rope_for_trtllm_mla
+                # Already applied at the q-prep/indexer overlap fork.
+                and not self._q8kv8_qprep_overlap_pending
+            ):
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if born_q_backend is not None:
-            # Born-fp8 q (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): one fused
-            # kernel replaces bmm -> bf16 q_nope_out ->
-            # concat_and_cast_q_fp8_pad.  q_nope is the pre-absorb bf16 view
-            # (rope only touched the disjoint q_pe columns) and q_pe carries
-            # the post-rope values.  The stash is consumed by
-            # _forward_flashmla_sparse_q8kv8; q_nope_out becomes a
-            # NaN-poisoned shape-only sentinel.
-            num_tokens = q_nope.shape[0]
-            if self._q8kv8_qprep_overlap_pending:
-                # q_fp8 was produced on alt_stream at the fork above; join so
-                # everything downstream (incl. the next layer's fork, which
-                # reuses the single born-q slot) orders after it.
-                torch.cuda.current_stream().wait_stream(self.alt_stream)
-                self._q8kv8_qprep_overlap_pending = False
-            else:
-                q_fp8 = born_q_backend.q8kv8_acquire_born_q_buffer(
-                    num_tokens,
-                    self.num_local_heads,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                    q_nope.device,
+            if born_q_backend is not None:
+                # Born-fp8 q (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): one fused
+                # kernel replaces bmm -> bf16 q_nope_out ->
+                # concat_and_cast_q_fp8_pad.  q_nope is the pre-absorb bf16 view
+                # (rope only touched the disjoint q_pe columns) and q_pe carries
+                # the post-rope values.  The stash is consumed by
+                # _forward_flashmla_sparse_q8kv8; q_nope_out becomes a
+                # NaN-poisoned shape-only sentinel.
+                num_tokens = q_nope.shape[0]
+                if self._q8kv8_qprep_overlap_pending:
+                    # q_fp8 was produced on alt_stream at the fork above; join so
+                    # everything downstream (incl. the next layer's fork, which
+                    # reuses the single born-q slot) orders after it.
+                    torch.cuda.current_stream().wait_stream(self.alt_stream)
+                    self._q8kv8_qprep_overlap_pending = False
+                else:
+                    q_fp8 = born_q_backend.q8kv8_acquire_born_q_buffer(
+                        num_tokens,
+                        self.num_local_heads,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                        q_nope.device,
+                    )
+                    absorbed_bmm_concat_cast_q_fp8(
+                        q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
+                    )
+                born_q_backend.q8kv8_stash_born_q(num_tokens, self.attn_mqa.layer_id)
+                q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
+                    num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
                 )
-                absorbed_bmm_concat_cast_q_fp8(
-                    q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
-                )
-            born_q_backend.q8kv8_stash_born_q(num_tokens, self.attn_mqa.layer_id)
-            q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
-                num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
+
+            k_nope, k_pe = prepare_kv_for_attention(
+                self,
+                forward_batch,
+                k_nope,
+                k_pe,
+                defer_materialization=fuse_rope_for_trtllm_mla,
             )
-
-        k_nope, k_pe = prepare_kv_for_attention(
-            self,
-            forward_batch,
-            k_nope,
-            k_pe,
-            defer_materialization=fuse_rope_for_trtllm_mla,
-        )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:

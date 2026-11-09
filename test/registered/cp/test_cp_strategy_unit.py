@@ -1111,6 +1111,41 @@ class TestCPInterleaveStrategy(CustomTestCase):
         self.assertTrue(torch.equal(full_k_nope, full_latent[:, :3].unsqueeze(1)))
         self.assertTrue(torch.equal(full_k_rope, full_latent[:, 3:].unsqueeze(1)))
 
+    def test_interleave_gather_honors_cuda_stream_context(self):
+        """Non-None stream must wrap the collective via torch.cuda.stream()."""
+        strategy = InterleaveCPStrategy(cp_size=2)
+        fake_stream = object()
+        x = SimpleNamespace(is_cuda=True)
+        sentinel = object()
+        entered = []
+
+        class _StreamCM:
+            def __enter__(self):
+                entered.append(fake_stream)
+                return fake_stream
+
+            def __exit__(self, *args):
+                return False
+
+        forward_batch = SimpleNamespace()
+        with (
+            patch(
+                "sglang.srt.layers.cp.interleave.torch.cuda.stream",
+                side_effect=lambda s: _StreamCM(),
+            ) as stream_cm,
+            patch.object(
+                strategy,
+                "_gather_interleaved_tensor_impl",
+                return_value=sentinel,
+            ) as impl,
+        ):
+            out = strategy.gather_kv_cache(x, forward_batch, stream=fake_stream)
+
+        stream_cm.assert_called_once_with(fake_stream)
+        self.assertEqual(entered, [fake_stream])
+        impl.assert_called_once_with(x, forward_batch)
+        self.assertIs(out, sentinel)
+
 
 if __name__ == "__main__":
     unittest.main()

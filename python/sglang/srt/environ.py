@@ -1703,6 +1703,12 @@ class Envs:
     # predicate.  Coarse per-layer join keeps the single-slot born-q buffer
     # WAR-safe.
     SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP = EnvBool(False)
+    # Opt-in Prefill-CP: after materialize_compression_inputs (key‖gate
+    # all-gather), launch rope(k)+materialize_full_mla_kv on alt_stream under
+    # kpool compress→logits/topk. Interleave EXTEND only; BCG / capture /
+    # trtllm fused-rope defer paths stay serial. Requires gather to honor
+    # ``with torch.cuda.stream`` (see InterleaveCPStrategy).
+    SGLANG_ENABLE_CP_MLA_KV_GATHER_OVERLAP = EnvBool(False)
     # Opt-in: fuse the Q8KV8 non-prefix KV prep — cast-concat k/k_rope
     # directly into the persistent fp8 kv buffer and zero the pad band in one
     # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).

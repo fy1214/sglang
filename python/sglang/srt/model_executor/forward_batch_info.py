@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import lru_cache, total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -781,6 +781,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
+
+    # Prefill-CP: MLA latent KV all-gather overlap handshake (see
+    # sglang.srt.layers.cp.mla_gather_overlap). Installed for one layer's
+    # indexer→attention window; cleared after join.
+    cp_mla_gather_overlap: Optional[Any] = None
 
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the

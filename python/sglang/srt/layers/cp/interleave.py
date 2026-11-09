@@ -265,14 +265,26 @@ class InterleaveCPStrategy(ContextParallelStrategy):
     def gather_hidden_states(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
-        return self._gather_interleaved_tensor(x, forward_batch)
+        return self._gather_interleaved_tensor(x, forward_batch, stream=stream)
 
     def gather_kv_cache(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
-        return self._gather_interleaved_tensor(x, forward_batch)
+        return self._gather_interleaved_tensor(x, forward_batch, stream=stream)
 
-    def _gather_interleaved_tensor(self, x: Any, forward_batch) -> Any:
+    def _gather_interleaved_tensor(
+        self, x: Any, forward_batch, stream: Optional[Any] = None
+    ) -> Any:
+        # NCCL collectives follow the *current* CUDA stream (the all-gather
+        # custom op has no stream kwarg). When a non-default stream is
+        # requested, wrap the whole pad + collective + reorder path so the
+        # work is enqueued there — passing ``stream`` alone is a no-op.
+        if stream is not None and getattr(x, "is_cuda", False):
+            with torch.cuda.stream(stream):
+                return self._gather_interleaved_tensor_impl(x, forward_batch)
+        return self._gather_interleaved_tensor_impl(x, forward_batch)
+
+    def _gather_interleaved_tensor_impl(self, x: Any, forward_batch) -> Any:
         metadata = getattr(forward_batch, "attn_cp_metadata", None)
         if metadata is None:
             raise RuntimeError("Interleave CP gather requires attn_cp_metadata.")
@@ -379,11 +391,14 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         layer: Any,
         k_nope: Any,
         k_rope: Any,
+        stream: Optional[Any] = None,
     ) -> Any:
         kv_lora_rank = k_nope.shape[-1]
         latent_cache = torch.cat([k_nope, k_rope], dim=-1).squeeze(1)
         full_latent = self.gather_kv_cache(
-            latent_cache.contiguous(), forward_batch, torch.cuda.current_stream()
+            latent_cache.contiguous(),
+            forward_batch,
+            stream if stream is not None else torch.cuda.current_stream(),
         )
         k_nope = full_latent[..., :kv_lora_rank].unsqueeze(1)
         k_rope = full_latent[..., kv_lora_rank:].unsqueeze(1)

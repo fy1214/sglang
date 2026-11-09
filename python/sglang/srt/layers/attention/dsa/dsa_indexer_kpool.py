@@ -629,6 +629,11 @@ class IndexerKPool(MultiPlatformOp):
         key, gate_score, positions = materialize_compression_inputs(
             key, gate_score, positions, forward_batch
         )
+        # Prefill-CP: compression-input gather done — start MLA latent KV
+        # all-gather on alt_stream while compress continues here.
+        overlap = getattr(forward_batch, "cp_mla_gather_overlap", None)
+        if overlap is not None:
+            overlap.launch_after_compression_gather()
         if key.shape[0] == 0:
             return None
 

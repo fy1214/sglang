@@ -228,8 +228,13 @@ class ContextParallelStrategy(ABC):
         layer: Any,
         k_nope: Any,
         k_rope: Any,
+        stream: Optional[Any] = None,
     ) -> Any:
-        """Materialize full-layout MLA K/V for the strategy."""
+        """Materialize full-layout MLA K/V for the strategy.
+
+        ``stream`` selects the CUDA stream that must own the CP all-gather
+        (NCCL follows the current stream; strategies wrap the collective).
+        """
 
     def reindex_attn_metadata(self, core_attn_metadata: Any) -> None:
         """Optional attention metadata rewrite for strategies that need it."""
