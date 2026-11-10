@@ -648,10 +648,26 @@ class Glm5NextLinearAttention(nn.Module):
         from sglang.srt.layers.cp.interleave import (
             cp_interleave_to_sequence_order,
             cp_sequence_to_interleave_order,
+            is_interleave_extend,
+        )
+        from sglang.srt.layers.cp.zigzag import (
+            cp_sequence_to_zigzag_gathered_order,
+            cp_zigzag_gathered_to_sequence_order,
+            is_zigzag_extend,
         )
 
+        # Layer-boundary AG stacks equal rank shards; KDA needs chronological
+        # token order. Interleave and zigzag each restore (and later undo) that
+        # layout; a no-op here leaves zigzag rank-major and corrupts recurrence.
         gathered_rows = hidden_states.shape[0]
-        hidden_states = cp_interleave_to_sequence_order(hidden_states, forward_batch)
+        if is_interleave_extend(forward_batch):
+            hidden_states = cp_interleave_to_sequence_order(
+                hidden_states, forward_batch
+            )
+        elif is_zigzag_extend(forward_batch):
+            hidden_states = cp_zigzag_gathered_to_sequence_order(
+                hidden_states, forward_batch
+            )
 
         if self.do_fuse_qkvbfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
@@ -677,9 +693,14 @@ class Glm5NextLinearAttention(nn.Module):
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
-        return cp_sequence_to_interleave_order(
-            self.o_proj(core_attn_out)[0], forward_batch, gathered_rows
-        )
+        out = self.o_proj(core_attn_out)[0]
+        if is_interleave_extend(forward_batch):
+            return cp_sequence_to_interleave_order(out, forward_batch, gathered_rows)
+        if is_zigzag_extend(forward_batch):
+            return cp_sequence_to_zigzag_gathered_order(
+                out, forward_batch, gathered_rows
+            )
+        return out
 
 
 class Glm5NextDecoderLayer(nn.Module):

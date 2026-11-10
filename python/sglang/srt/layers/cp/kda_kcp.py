@@ -75,13 +75,23 @@ def merge_affine_segment_states(
 
 
 def _apply_transition(m: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-    """Apply ``M @ S`` for state layouts ``[..., dk, dv]`` and ``M`` ``[..., dk, dk]``."""
+    """Apply ``M @ S`` for state layouts ``[..., dk, dv]`` and ``M`` ``[..., dk, dk]``.
+
+    Supported:
+    - matched batch dims: ``m.shape[:-1] == state.shape[:-1]`` (e.g. both ``[H,dk,*]``)
+    - head-free ``M`` over a leading head dim on ``S``: ``m=[dk,dk]``, ``state=[H,dk,dv]``
+    """
     if m.ndim == state.ndim and m.shape[:-1] == state.shape[:-1]:
         # [..., dk, dk] @ [..., dk, dv]
         return torch.matmul(m, state)
-    if m.ndim + 1 == state.ndim:
-        # broadcast head-free M over an extra leading head dim on state
-        return torch.matmul(m, state)
+    if (
+        m.ndim == 2
+        and state.ndim == 3
+        and m.shape[0] == state.shape[1]
+        and m.shape[1] == state.shape[1]
+    ):
+        # M=[dk,dk], S=[H,dk,dv] — do not matmul([dk,dk],[H,dk,dv]) directly.
+        return torch.einsum("ij,hjk->hik", m, state)
     raise ValueError(
         f"Unsupported M/S shapes: m={tuple(m.shape)} s={tuple(state.shape)}"
     )

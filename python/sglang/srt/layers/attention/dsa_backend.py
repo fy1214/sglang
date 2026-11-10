@@ -71,7 +71,7 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolWritePlan,
 )
 from sglang.srt.layers.attention.dsa.utils import (
-    can_dsa_prefill_cp_interleave,
+    can_dsa_prefill_cp_sharded,
     compute_dsa_seqlens,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -1136,7 +1136,7 @@ class DeepseekSparseAttnBackend(
                 )
                 kpool_inputs.full_seqlens_expanded = seqlens_expanded
 
-            if can_dsa_prefill_cp_interleave(forward_batch):
+            if can_dsa_prefill_cp_sharded(forward_batch):
                 strategy = get_cp_strategy()
                 seqlens_expanded = strategy.shard_local_tokens(
                     seqlens_expanded, forward_batch
@@ -1232,7 +1232,7 @@ class DeepseekSparseAttnBackend(
             # Device EXTEND CP path: expand full then shard_local_tokens.
             if (
                 forward_batch.forward_mode.is_context_parallel_extend()
-                and can_dsa_prefill_cp_interleave(forward_batch)
+                and can_dsa_prefill_cp_sharded(forward_batch)
             ):
                 expanded_cpu = get_cp_strategy().shard_local_tokens(
                     expanded_cpu, forward_batch
@@ -1381,7 +1381,7 @@ class DeepseekSparseAttnBackend(
         ke = torch.cat(ke_list, dim=0)
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
         if bs_idx is not None:
-            assert can_dsa_prefill_cp_interleave(forward_batch)
+            assert can_dsa_prefill_cp_sharded(forward_batch)
             strategy = get_cp_strategy()
             ks = strategy.shard_local_tokens(ks, forward_batch)
             ke = strategy.shard_local_tokens(ke, forward_batch)

@@ -122,6 +122,95 @@ def zigzag_rows_per_request(
     return counts
 
 
+def is_zigzag_extend(forward_batch) -> bool:
+    return forward_batch.forward_mode.is_context_parallel_extend() and isinstance(
+        forward_batch.attn_cp_metadata, ZigzagContextParallelMetadata
+    )
+
+
+def _zigzag_rank_major_logical(hidden_states: torch.Tensor, forward_batch):
+    """Strip CP padding from a boundary all-gather into rank-major logical rows.
+
+    Layer-boundary DSA/MLA CP uses ``attn_cp_interleave_gather``, which stacks
+    equal physical shards ``[rank0_pad | rank1_pad | ...]``. Zigzag KDA needs
+    the unpadded concatenation before ``cp_reverse_index`` reordering.
+    """
+    meta = forward_batch.attn_cp_metadata
+    cp_size = get_parallel().attn_cp_size
+    per_rank = meta.per_rank_logical_token or meta.per_rank_actual_token
+    physical = max(meta.per_rank_actual_token)
+    expected_padded = cp_size * physical
+    expected_logical = sum(int(n) for n in per_rank)
+    if hidden_states.shape[0] == expected_padded:
+        chunks = torch.split(hidden_states, physical, dim=0)
+        return torch.cat(
+            [chunks[rank][: per_rank[rank]] for rank in range(cp_size)], dim=0
+        )
+    if hidden_states.shape[0] == expected_logical:
+        return hidden_states
+    raise RuntimeError(
+        "Zigzag CP sequence restore got unexpected gathered rows: "
+        f"got={hidden_states.shape[0]}, expected_padded={expected_padded}, "
+        f"expected_logical={expected_logical}, cp_size={cp_size}."
+    )
+
+
+def cp_zigzag_gathered_to_sequence_order(hidden_states, forward_batch):
+    """Reorder already-gathered zigzag shards to chronological token order.
+
+    Communication already happened at the layer boundary; this only permutes.
+    Without it, KDA would recur over rank-major zigzag blocks and go wrong.
+    """
+    if not is_zigzag_extend(forward_batch):
+        return hidden_states
+    meta = forward_batch.attn_cp_metadata
+    gathered = _zigzag_rank_major_logical(hidden_states, forward_batch)
+    chunks = torch.split(gathered, meta.reverse_split_len, dim=0)
+    return torch.cat([chunks[i] for i in meta.cp_reverse_index], dim=0).contiguous()
+
+
+def cp_sequence_to_zigzag_gathered_order(hidden_states, forward_batch, gathered_rows):
+    """Chronological tokens → rank-major padded zigzag layout for reduce-scatter."""
+    if not is_zigzag_extend(forward_batch):
+        return hidden_states
+    meta = forward_batch.attn_cp_metadata
+    cp_size = get_parallel().attn_cp_size
+    per_rank = meta.per_rank_logical_token or meta.per_rank_actual_token
+    physical = max(meta.per_rank_actual_token)
+    chrono_lens = [meta.reverse_split_len[i] for i in meta.cp_reverse_index]
+    if hidden_states.shape[0] != sum(chrono_lens):
+        raise RuntimeError(
+            "Zigzag CP sequence→gathered got unexpected chrono rows: "
+            f"got={hidden_states.shape[0]}, expected={sum(chrono_lens)}."
+        )
+    chrono_parts = torch.split(hidden_states, chrono_lens, dim=0)
+    slots: List[Optional[torch.Tensor]] = [None] * len(meta.reverse_split_len)
+    for chrono_i, slot_i in enumerate(meta.cp_reverse_index):
+        slots[slot_i] = chrono_parts[chrono_i]
+    gathered_logical = torch.cat(slots, dim=0)
+
+    rank_chunks = []
+    offset = 0
+    for rank in range(cp_size):
+        n = int(per_rank[rank])
+        piece = gathered_logical[offset : offset + n]
+        offset += n
+        pad = physical - piece.shape[0]
+        if pad > 0:
+            padding = [0, 0] * (piece.ndim - 1) + [0, pad]
+            piece = F.pad(piece, padding, mode="constant", value=0)
+        rank_chunks.append(piece)
+    out = torch.cat(rank_chunks, dim=0)
+    if out.shape[0] != gathered_rows:
+        # Boundary AG may have used a different pad align; match caller size.
+        if out.shape[0] < gathered_rows:
+            padding = [0, 0] * (out.ndim - 1) + [0, gathered_rows - out.shape[0]]
+            out = F.pad(out, padding, mode="constant", value=0)
+        else:
+            out = out[:gathered_rows]
+    return out.contiguous()
+
+
 class ZigzagCPStrategy(ContextParallelStrategy):
     name = "zigzag"
     kind = ContextParallelStrategyKind.ZIGZAG

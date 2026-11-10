@@ -200,14 +200,14 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
         tokens = max(global_num_tokens)
     else:
         tokens = global_num_tokens[dp_slot_in(global_num_tokens)]
-    if can_dsa_prefill_cp_interleave(forward_batch):
+    if can_dsa_prefill_cp_sharded(forward_batch):
         tokens = ceil_div(tokens, attn_cp_size)
     return tokens
 
 
 def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
     attn_cp_size = get_parallel().attn_cp_size
-    needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_interleave(forward_batch)
+    needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_sharded(forward_batch)
     needs_dp_pad = forward_batch.global_num_tokens_cpu is not None
     if not needs_cp_pad and not needs_dp_pad:
         return dsa_cache_seqlens
