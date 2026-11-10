@@ -1,4 +1,4 @@
-"""KPool compression and query metadata for interleave context parallelism."""
+"""KPool compression and query metadata for Prefill-CP (interleave / zigzag)."""
 
 import torch
 
@@ -7,17 +7,28 @@ from sglang.srt.layers.cp.interleave import (
     interleave_rows_per_request,
     is_interleave_extend,
 )
+from sglang.srt.layers.cp.utils import is_dsa_cp_extend
+from sglang.srt.layers.cp.zigzag import zigzag_rows_per_request
 from sglang.srt.runtime_context import get_parallel
 
 
 def local_query_inputs(forward_batch, metadata):
     """Compression covers full requests; logits cover only this rank's queries."""
-    if not is_interleave_extend(forward_batch):
+    if not is_dsa_cp_extend(forward_batch):
         return {}
     parallel = get_parallel()
-    counts = interleave_rows_per_request(
-        forward_batch.extend_seq_lens_cpu, parallel.attn_cp_rank, parallel.attn_cp_size
-    )
+    if is_interleave_extend(forward_batch):
+        counts = interleave_rows_per_request(
+            forward_batch.extend_seq_lens_cpu,
+            parallel.attn_cp_rank,
+            parallel.attn_cp_size,
+        )
+    else:
+        counts = zigzag_rows_per_request(
+            forward_batch.extend_seq_lens_cpu,
+            parallel.attn_cp_rank,
+            parallel.attn_cp_size,
+        )
     # Build indices on pinned host memory and async-H2D. A direct
     # ``torch.tensor(..., device=cuda)`` pageable upload inserts a stream sync
     # that stalls behind pending GEMM (~200ms seen in CP8 EXTEND traces).
@@ -43,8 +54,11 @@ def materialize_compression_inputs(key, score, positions, forward_batch):
 
     Queries and head gates stay local. Every rank writes its replicated index
     cache and tail state, so subsequent decode needs no layer-owner protocol.
+
+    Both interleave and zigzag gather via ``get_cp_strategy().gather_kv_cache``,
+    which restores global chronological token order before kpool.
     """
-    if not is_interleave_extend(forward_batch):
+    if not is_dsa_cp_extend(forward_batch):
         return key, score, positions
     width = key.shape[-1]
     packed = torch.cat((key, score), dim=-1)

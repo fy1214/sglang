@@ -1709,6 +1709,10 @@ class Envs:
     # trtllm fused-rope defer paths stay serial. Requires gather to honor
     # ``with torch.cuda.stream`` (see InterleaveCPStrategy).
     SGLANG_ENABLE_CP_MLA_KV_GATHER_OVERLAP = EnvBool(False)
+    # Experimental Glm5Next zigzag Prefill-CP + KDA KCP scaffold (target: remove
+    # KDA layer-boundary activation AG/RS). DSA zigzag materialize lands first;
+    # full FlashKDA prepare/summary/scan still gated behind this flag.
+    SGLANG_ENABLE_GLM_ZIGZAG_KCP = EnvBool(False)
     # Opt-in: fuse the Q8KV8 non-prefix KV prep — cast-concat k/k_rope
     # directly into the persistent fp8 kv buffer and zero the pad band in one
     # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).

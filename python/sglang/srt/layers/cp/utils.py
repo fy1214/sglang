@@ -135,6 +135,17 @@ def is_cp_active(forward_batch) -> bool:
     return strategy.can_apply(len(input_ids), forward_batch)
 
 
+def is_dsa_cp_extend(forward_batch) -> bool:
+    """True when Prefill-CP EXTEND carries interleave or zigzag DSA metadata."""
+    forward_mode = getattr(forward_batch, "forward_mode", None)
+    if forward_mode is None or not forward_mode.is_context_parallel_extend():
+        return False
+    metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    return isinstance(
+        metadata, (InterleaveContextParallelMetadata, ZigzagContextParallelMetadata)
+    )
+
+
 def is_mla_cp_enabled() -> bool:
     """Return whether prefill CP is configured for an MLA attention backend."""
     return is_cp_enabled() and uses_mla_backend()

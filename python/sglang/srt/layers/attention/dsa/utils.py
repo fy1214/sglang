@@ -132,6 +132,15 @@ def is_dsa_prefill_cp_interleave():
     return is_dsa_enable_prefill_cp() and get_parallel().cp_strategy == "interleave"
 
 
+def is_dsa_prefill_cp_zigzag():
+    return is_dsa_enable_prefill_cp() and get_parallel().cp_strategy == "zigzag"
+
+
+def is_dsa_prefill_cp_sharded():
+    """Token-sharded Prefill-CP layouts that DSA materialize understands."""
+    return is_dsa_prefill_cp_interleave() or is_dsa_prefill_cp_zigzag()
+
+
 # Retain the name imported by the unchanged HIP radix attention backend.
 is_dsa_prefill_cp_round_robin_split = is_dsa_prefill_cp_interleave
 
@@ -149,17 +158,21 @@ def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     )
 
 
-def can_dsa_prefill_cp_interleave(forward_batch: "ForwardBatch"):
+def can_dsa_prefill_cp_sharded(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
         return False
     cp_size = get_parallel().attn_cp_size
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
-    return (
-        is_dsa_prefill_cp_interleave()
-        and seq_len > 0
-        and seq_len >= cp_size
-        and cp_size > 1
-    )
+    if not (is_dsa_prefill_cp_sharded() and seq_len > 0 and cp_size > 1):
+        return False
+    # Zigzag needs 2*C blocks; interleave only needs C tokens.
+    min_tokens = cp_size * 2 if is_dsa_prefill_cp_zigzag() else cp_size
+    return seq_len >= min_tokens
+
+
+def can_dsa_prefill_cp_interleave(forward_batch: "ForwardBatch"):
+    # Historical name: call sites mean "DSA Prefill-CP token shard is active".
+    return can_dsa_prefill_cp_sharded(forward_batch)
 
 
 def cal_padded_tokens(forward_batch: "ForwardBatch"):

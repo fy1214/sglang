@@ -225,7 +225,8 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             self.cp_rank, int(num_tokens), self.cp_size, device=device, dtype=torch.long
         )
 
-    def shard_local_tokens(self, input_: Any) -> Any:
+    def shard_local_tokens(self, input_: Any, forward_batch=None) -> Any:
+        del forward_batch
         return self._interleave_shard(input_)
 
     def shard_per_request(

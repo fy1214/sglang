@@ -102,6 +102,26 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
 ContextParallelMetadata = ZigzagContextParallelMetadata
 
 
+def zigzag_rows_per_request(
+    extend_lens: List[int], cp_rank: int, cp_size: int
+) -> List[int]:
+    """Local token rows each request contributes on this zigzag CP rank.
+
+    Rank ``r`` owns block ``r`` (early) and block ``2C-1-r`` (late) of every
+    request's ``2C`` contiguous blocks.
+    """
+    cp_segment_num = cp_size * 2
+    counts: List[int] = []
+    for length in extend_lens:
+        base = int(length) // cp_segment_num
+        rem = int(length) % cp_segment_num
+        block_sizes = [
+            base + 1 if block_id < rem else base for block_id in range(cp_segment_num)
+        ]
+        counts.append(block_sizes[cp_rank] + block_sizes[cp_segment_num - 1 - cp_rank])
+    return counts
+
+
 class ZigzagCPStrategy(ContextParallelStrategy):
     name = "zigzag"
     kind = ContextParallelStrategyKind.ZIGZAG
@@ -364,7 +384,62 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         return [
             CPAttentionBackendKind.FLASH_ATTENTION,
             CPAttentionBackendKind.TRTLLM_MHA,
+            CPAttentionBackendKind.DSA,
         ]
+
+    def shard_local_tokens(self, input_: Any, forward_batch=None) -> Any:
+        """Select this rank's zigzag token rows from a global-order tensor."""
+        if (
+            forward_batch is None
+            or getattr(forward_batch, "attn_cp_metadata", None) is None
+        ):
+            raise RuntimeError(
+                "Zigzag shard_local_tokens requires forward_batch.attn_cp_metadata."
+            )
+        if isinstance(input_, (tuple, list)):
+            indices = self.local_q_indices(len(input_), forward_batch)
+            if indices.numel() == 0:
+                return input_.__class__()
+            index_list = indices.tolist()
+            return input_.__class__(input_[i] for i in index_list)
+
+        tokens = int(input_.shape[0]) if hasattr(input_, "shape") else len(input_)
+        indices = self.local_q_indices(tokens, forward_batch)
+        if indices.numel() == 0:
+            if hasattr(input_, "new_empty"):
+                return input_.new_empty(0, *input_.shape[1:])
+            return input_[:0]
+        return input_[indices]
+
+    def shard_per_request(
+        self,
+        extend_seqs_cpu: List[int],
+        extend_seqs: Any,
+    ):
+        """Per-request local q lengths for this zigzag rank (Python first cut)."""
+        counts = zigzag_rows_per_request(extend_seqs_cpu, self.cp_rank, self.cp_size)
+        bs_idx_cpu = [i for i, q_len in enumerate(counts) if q_len > 0]
+        q_lens_cpu = [q_len for q_len in counts if q_len > 0]
+        q_lens = torch.tensor(
+            q_lens_cpu, device=extend_seqs.device, dtype=extend_seqs.dtype
+        )
+        bs_idx = torch.tensor(bs_idx_cpu, device=extend_seqs.device, dtype=torch.int32)
+        return q_lens_cpu, q_lens, bs_idx_cpu, bs_idx
+
+    def materialize_full_indexer_k_cache(self, key: Any, forward_batch) -> Any:
+        return self.gather_kv_cache(
+            key.contiguous(), forward_batch, torch.cuda.current_stream()
+        )
+
+    def all_gather_dsa_trtllm_fp8_kv(self, forward_batch, k: Any, k_rope: Any) -> Any:
+        kv_lora_rank = k.shape[-1]
+        qk_rope_head_dim = k_rope.shape[-1]
+        kv_dtype = k.dtype
+        kv = torch.cat((k, k_rope), dim=-1).view(torch.uint8)
+        kv = self.gather_kv_cache(
+            kv.contiguous(), forward_batch, torch.cuda.current_stream()
+        ).view(kv_dtype)
+        return kv.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
 
     def run_attention(
         self,
@@ -373,10 +448,14 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         device: Any,
         attn_fn,
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
+        **kwargs,
     ) -> Any:
         assert attention_backend in self.get_supported_attention_backend(), (
             f"{self.name} CP does not support {attention_backend=}"
         )
+        if attention_backend == CPAttentionBackendKind.DSA:
+            # DSA backend runs attention itself (same contract as interleave).
+            return None
 
         meta = forward_batch.attn_cp_metadata
         q_prev = q[: meta.total_q_prev_tokens]

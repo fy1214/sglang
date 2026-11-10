@@ -163,7 +163,9 @@ class ContextParallelStrategy(ABC):
             f"{self.name} strategy does not support per-request sharding"
         )
 
-    def shard_local_tokens(self, input_: Any) -> Any:
+    def shard_local_tokens(
+        self, input_: Any, forward_batch: ForwardBatch = None
+    ) -> Any:
         raise NotImplementedError(
             f"{self.name} strategy does not support local-token sharding"
         )
