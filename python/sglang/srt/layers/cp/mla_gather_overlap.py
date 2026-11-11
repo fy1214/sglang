@@ -15,8 +15,10 @@
 """Prefill-CP: overlap MLA latent KV all-gather with kpool compress→topk.
 
 After ``materialize_compression_inputs`` finishes the compression-input
-all-gather, launch rope(k) + ``materialize_full_mla_kv`` on ``alt_stream``
-while compress/logits/topk continue on the current stream.
+all-gather, launch **only** the attn-CP ``all_gather_into_tensor`` on
+``alt_stream`` while compress / mqa_logits / topk continue on the current
+stream. Pad / reorder / rope stay off ``alt_stream``.
+
 Gated by ``SGLANG_ENABLE_CP_MLA_KV_GATHER_OVERLAP``.
 """
 
@@ -27,19 +29,112 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
-from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.interleave import is_interleave_extend
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dp_attention import (
+    attn_cp_all_gather_into_tensor,
+    is_allocation_symmetric,
+)
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def _prepare_interleave_ag_buffers(
+    x: torch.Tensor, forward_batch: ForwardBatch, strategy: Any
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], dict[str, Any]]:
+    """Pad + allocate gather output on the *current* stream; no collective."""
+    metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    if metadata is None:
+        raise RuntimeError("Interleave CP gather requires attn_cp_metadata.")
+
+    total_tokens = int(metadata.total_seq_lens)
+    if total_tokens < 0:
+        raise RuntimeError(
+            f"Invalid interleave CP total_seq_lens={total_tokens}; expected >= 0."
+        )
+
+    logical_rank_lens = (
+        metadata.per_rank_logical_token or metadata.per_rank_actual_token
+    )
+    local_logical_len = logical_rank_lens[strategy.cp_rank]
+    if x.shape[0] < local_logical_len:
+        raise RuntimeError(
+            "Interleave CP gather received an unexpected local token count: "
+            f"rank={strategy.cp_rank}, got={x.shape[0]}, "
+            f"expected_at_least={local_logical_len}, "
+            f"total={total_tokens}, cp_size={strategy.cp_size}."
+        )
+
+    physical_rank_len = max(metadata.per_rank_actual_token)
+    ctx = {
+        "metadata": metadata,
+        "total_tokens": total_tokens,
+        "physical_rank_len": physical_rank_len,
+        "cp_size": strategy.cp_size,
+        "tail_shape": tuple(x.shape[1:]),
+        "device": x.device,
+    }
+    if physical_rank_len == 0:
+        return None, None, ctx
+
+    padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
+    padded_x[:local_logical_len] = x[:local_logical_len]
+    with use_symmetric_memory(
+        get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
+    ):
+        gathered = x.new_empty((strategy.cp_size * physical_rank_len, *x.shape[1:]))
+    return padded_x, gathered, ctx
+
+
+def _finish_interleave_ag(
+    gathered: Optional[torch.Tensor], ctx: dict[str, Any]
+) -> torch.Tensor:
+    """Reorder AG output into sequence order on the *current* stream."""
+    metadata = ctx["metadata"]
+    total_tokens = ctx["total_tokens"]
+    physical_rank_len = ctx["physical_rank_len"]
+    cp_size = ctx["cp_size"]
+    tail_shape = ctx["tail_shape"]
+    device = ctx["device"]
+
+    if physical_rank_len == 0 or gathered is None:
+        return (
+            gathered.new_empty((0, *tail_shape))
+            if gathered is not None
+            else (torch.empty((0, *tail_shape), device=device))
+        )
+
+    if metadata.gather_index is not None:
+        return gathered.index_select(0, metadata.gather_index)
+
+    actual = metadata.per_rank_actual_token
+    if total_tokens == cp_size * physical_rank_len and all(
+        int(n) == physical_rank_len for n in actual
+    ):
+        return (
+            gathered.view(cp_size, physical_rank_len, *tail_shape)
+            .transpose(0, 1)
+            .reshape(total_tokens, *tail_shape)
+        )
+
+    flat_indices = torch.arange(total_tokens, device=device)
+    gather_indices = (
+        flat_indices % cp_size
+    ) * physical_rank_len + flat_indices // cp_size
+    return gathered.index_select(0, gather_indices)
+
+
 @dataclass
 class CpMlaGatherOverlapState:
-    """Per-layer handshake: compression-input gather done → MLA KV gather on alt_stream."""
+    """Per-layer handshake: compression-input gather done → MLA KV all-gather on alt_stream."""
 
     attn_mla: Any
     forward_batch: ForwardBatch
@@ -52,50 +147,58 @@ class CpMlaGatherOverlapState:
     pending: bool = False
     roped: bool = False
     _consumer_stream: Optional[torch.cuda.Stream] = field(default=None, repr=False)
+    _kv_lora_rank: int = 0
+    _ag_gathered: Optional[torch.Tensor] = field(default=None, repr=False)
+    _ag_ctx: Optional[dict[str, Any]] = field(default=None, repr=False)
 
     def launch_after_compression_gather(self) -> None:
-        """Enqueue rope(q/k pe) + MLA latent KV all-gather on ``alt_stream``.
+        """Enqueue **only** attn-CP all-gather on ``alt_stream``.
 
-        Must run on the stream that just finished ``materialize_compression_inputs``
-        (typically current) so ``alt.wait_stream(current)`` sees that gather complete.
+        Pad/alloc run on the current stream before the fork. No rope, no
+        reorder, no ``prepare_kv_for_attention`` on alt. Caller must rope
+        after ``wait_and_take`` when ``roped`` is False.
         """
         if self.launched:
             return
         self.launched = True
         current = torch.cuda.current_stream()
         self._consumer_stream = current
+
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        self._kv_lora_rank = int(self.k_nope.shape[-1])
+        latent = torch.cat([self.k_nope, self.k_pe], dim=-1).squeeze(1).contiguous()
+        padded, gathered, ctx = _prepare_interleave_ag_buffers(
+            latent, self.forward_batch, strategy
+        )
+        self._ag_ctx = ctx
+        self._ag_gathered = gathered
+        self.roped = False
+
         self.alt_stream.wait_stream(current)
-        attn = self.attn_mla
-        with torch.cuda.stream(self.alt_stream):
-            q_pe, k_pe = self.q_pe, self.k_pe
-            if attn.rotary_emb is not None:
-                q_pe, k_pe = attn.rotary_emb(self.positions, q_pe, k_pe)
-                self.roped = True
-            k_nope, k_pe = prepare_kv_for_attention(
-                attn,
-                self.forward_batch,
-                self.k_nope,
-                k_pe,
-                defer_materialization=False,
-                stream=self.alt_stream,
-            )
-            # Cross-stream lifetime for the consumer (current) stream.
-            for t in (k_nope, k_pe, q_pe):
-                if isinstance(t, torch.Tensor) and t.is_cuda:
-                    t.record_stream(current)
-            self.k_nope = k_nope
-            self.k_pe = k_pe
-            self.q_pe = q_pe
+        if padded is not None and gathered is not None:
+            with torch.cuda.stream(self.alt_stream):
+                # Sole kernel/collective on alt_stream.
+                attn_cp_all_gather_into_tensor(gathered, padded.contiguous())
+                gathered.record_stream(current)
+                padded.record_stream(current)
         self.pending = True
 
     def wait_and_take(
         self,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
-        """Join alt_stream; return (k_nope, k_pe, q_pe, roped)."""
+        """Join alt_stream; reorder AG output; return pre-rope (k_nope, k_pe, q_pe, False)."""
         if self.pending:
             torch.cuda.current_stream().wait_stream(self.alt_stream)
             self.pending = False
-        return self.k_nope, self.k_pe, self.q_pe, self.roped
+
+        assert self._ag_ctx is not None
+        full_latent = _finish_interleave_ag(self._ag_gathered, self._ag_ctx)
+        rank = self._kv_lora_rank
+        k_nope = full_latent[..., :rank].unsqueeze(1)
+        k_pe = full_latent[..., rank:].unsqueeze(1)
+        # q_pe stays the local pre-rope view; rope on the consumer stream.
+        return k_nope, k_pe, self.q_pe, False
 
 
 def cp_mla_gather_overlap_enabled() -> bool:
