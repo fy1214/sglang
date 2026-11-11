@@ -498,6 +498,15 @@ class DeepseekMLAForwardMixin:
         if q_nope is None:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
+        # Prefill-CP MLA KV gather may still be running on alt_stream
+        # (rope writes q_pe, a view into the same storage as q_nope after split).
+        # Join before Q absorb/bmm so current-stream bmm cannot race that alias.
+        # Do not clear here: keep launched=True so the later overlap_done branch
+        # skips a second rotary_emb; wait_and_take is then a no-op.
+        _ov = getattr(forward_batch, "cp_mla_gather_overlap", None)
+        if _ov is not None and getattr(_ov, "launched", False):
+            k_nope, k_pe, q_pe, _roped = _ov.wait_and_take()
+
         _kvb_q = None
         born_q_backend = None
         if (
@@ -601,9 +610,9 @@ class DeepseekMLAForwardMixin:
             elif is_kv_b_lora_active(self):
                 q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
-        # Prefill-CP MLA latent KV gather may still be running on alt_stream
-        # (started after compression-input gather). Q absorb above can overlap
-        # its tail; join before rope/KV consumers. Singleton alt_stream must
+        # Prefill-CP MLA latent KV gather was joined before Q absorb above when
+        # overlap launched. Re-take here for consumers / skip second rope; if
+        # already waited, wait_and_take is a no-op. Singleton alt_stream must
         # be free before the next layer.
         overlap_state = getattr(forward_batch, "cp_mla_gather_overlap", None)
         overlap_done = bool(overlap_state is not None and overlap_state.launched)
