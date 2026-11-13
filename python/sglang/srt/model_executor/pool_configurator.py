@@ -546,7 +546,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
 
         return int(
-            indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
+            indexer_size_per_token
+            * num_indexer_layers
+            * element_size
+            * indexer_ratio
+            * get_parallel().attn_dcp_size
         )
 
     def calculate_pool_sizes(

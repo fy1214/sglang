@@ -63,6 +63,7 @@ from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.utils import (
+    is_dsa_enable_prefill_cp,
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
@@ -147,7 +148,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -2159,10 +2163,23 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
-        # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
+        # Q is all-gathered across DCP ranks before this layer runs. Under
+        # classic TP+DCP, num_local_heads is already TP-sharded. Under CP-TP
+        # sharing (attn_tp=1) with --enable-cp-decode-attn-tp, decode first
+        # slices heads by attn_cp_size, so post-gather heads are
+        # (num_heads // cp_size) * dcp_size — not num_local_heads * dcp_size
+        # (which would be num_heads * dcp_size, e.g. 64*8=512).
         if get_parallel().dcp_enabled:
+            dcp_decode_q_heads = self.num_local_heads * get_parallel().attn_dcp_size
+            if (
+                get_parallel().enable_cp_decode_attn_tp
+                and get_parallel().attn_cp_size > 1
+            ):
+                dcp_decode_q_heads = (
+                    self.num_heads // get_parallel().attn_cp_size
+                ) * get_parallel().attn_dcp_size
             self.attn_mqa_for_dcp_decode = RadixAttention(
-                self.num_local_heads * get_parallel().attn_dcp_size,
+                dcp_decode_q_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,
@@ -3438,6 +3455,17 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
+        kv_buffer_token_padding = 1
+        if is_deepseek_dsa(self.config):
+            # DSA TP+DCP uses Q gather and does not need a temporary KV view.
+            # CP+DCP gathers KV into a temporary buffer whose row layout and
+            # dtype match the token-to-KV pool values supplied by the caller.
+            if not (is_dsa_enable_prefill_cp() and get_parallel().attn_cp_size > 1):
+                return None
+            token_to_kv_pool = get_token_to_kv_pool()
+            # FlashMLA reshapes the flat gathered storage into physical pages.
+            # Logical DCP indices cover only the valid rows; padding is storage-only.
+            kv_buffer_token_padding = token_to_kv_pool.page_size
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -3450,6 +3478,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             kv_cache_dtype=kv_cache_dtype,
             kv_cache_device=kv_cache_device,
             create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+            kv_buffer_token_padding=kv_buffer_token_padding,
         )
 
 

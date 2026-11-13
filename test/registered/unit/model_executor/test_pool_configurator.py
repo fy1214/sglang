@@ -19,22 +19,20 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 @contextlib.contextmanager
-def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
-    """Mock GPU-dependent state; swa_eviction_interval is kept small so the
-    chunk-cap formula stays hand-computable."""
+def mock_cpu_env(kv_size=2, tp_size=1, dcp_size=1, swa_eviction_interval=4):
+    """Mock GPU-dependent functions for CPU-only testing.
+
+    swa_eviction_interval pins SGLANG_SWA_EVICTION_INTERVAL (decode batches between
+    SWA evictions) to a small value so the chunk-cap formula stays hand-computable;
+    only SWAChunkCapPoolConfigurator reads it.
+    """
     from sglang.srt.environ import envs
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
         get_parallel().override(
-            tp_size=tp_size,
             attn_tp_size=tp_size,
-            attn_dp_size=1,
-            attn_cp_size=1,
-            moe_ep_size=1,
-            moe_ep_group=None,
-            moe_dp_size=1,
-            moe_tp_size=tp_size,
+            attn_dcp_size=dcp_size,
         ),
         envs.SGLANG_SWA_EVICTION_INTERVAL.override(swa_eviction_interval),
     ):
@@ -298,6 +296,35 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(raw_configurator._cell_size, (576 + 132) * num_layers)
         self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_dsa_dcp_prices_replicated_indexer_cache(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        num_layers = 2
+        dcp_size = 8
+        runner = _make_model_runner(
+            self,
+            num_layers=num_layers,
+            use_mla_backend=True,
+        )
+        _configure_dsa_model(runner)
+
+        with mock_cpu_env(kv_size=1, dcp_size=dcp_size):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            configurator = DefaultPoolConfigurator(runner)
+
+        self.assertEqual(
+            configurator._cell_size,
+            (576 + 132 * dcp_size) * num_layers,
+        )
 
 
 class TestHybridSWAConfigurator(CustomTestCase):

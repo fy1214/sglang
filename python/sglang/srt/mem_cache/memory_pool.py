@@ -4919,6 +4919,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.slots_per_page = self.page_size
         if index_buf_size is None:
             index_buf_size = size
+            parallel = get_parallel()
+            if parallel.dcp_enabled:
+                # IndexKeyCache computes num_pages as
+                # (index_buf_size + page_size + 1) // page_size, which already
+                # adds one physical page. Subtract it here so the final capacity
+                # is exactly (size + page_size) * dcp_size.
+                index_buf_size = (size + page_size) * parallel.attn_dcp_size - page_size
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
