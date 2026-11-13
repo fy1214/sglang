@@ -240,8 +240,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    draft_kv_size = int(
-                        target_kv_size * draft_num_layers / target_kv_num_layers
+                    # Target MLA KV is per-rank sharded; draft KV is replicated
+                    # over the full logical span so multiply by dcp. Indexer
+                    # cell size already includes attn_dcp_size.
+                    draft_kv_size = (
+                        int(target_kv_size * draft_num_layers / target_kv_num_layers)
+                        * get_parallel().attn_dcp_size
                     )
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,

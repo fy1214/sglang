@@ -1684,6 +1684,7 @@ class KVCacheConfigurator:
             ),
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
             max_running_requests=max_running_requests,
+            dcp_replicated=self.loc_space_scale > 1,
             **pool_kwargs,
         )
         return token_to_kv_pool
@@ -1893,6 +1894,7 @@ class KVCacheConfigurator:
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
                     use_dsa=True,
+                    dcp_replicated=self.loc_space_scale > 1,
                     index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                     kv_cache_dim=calculate_mla_kv_cache_dim(
                         model_config=self.model_config,
@@ -1957,7 +1959,13 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             )
         token_to_kv_pool = pool_class(
-            page_size=self.pool_page_size,
+            # DSA kernels require the physical page size (64); replicated draft
+            # pools already widen `size` via loc_space_scale instead.
+            page_size=(
+                get_schedule().page_size
+                if extra_args.get("use_dsa")
+                else self.pool_page_size
+            ),
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
             head_num=head_num,

@@ -92,12 +92,12 @@ def _select_local_dcp_heads_for_autotune(
     attn_output: torch.Tensor, num_local_heads: int
 ) -> torch.Tensor:
     """Select this rank's head shard without communicating dummy outputs."""
-    rank = get_parallel().attn_dcp_rank
+    rank = get_attn_backend().dcp_rank
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
 
 
 def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
-    if not get_parallel().dcp_enabled:
+    if get_attn_backend().dcp_size == 1:
         return False
     return (
         forward_batch.forward_mode.is_decode()
@@ -109,7 +109,7 @@ def is_dsa_tp_dcp_prefill_phase(forward_batch: ForwardBatch, *, use_dsa: bool) -
     """Whether DSA TP+DCP prefill attends rank-local KV after gathering Q."""
     return (
         use_dsa
-        and get_parallel().dcp_enabled
+        and get_attn_backend().dcp_size > 1
         and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
         and not dsa_use_prefill_cp(forward_batch)
     )
@@ -223,7 +223,7 @@ class DeepseekMLAForwardMixin:
             return False
         # DCP must receive each rank's local LSE so it can combine partial
         # attention outputs. The composite graph op only returns the output.
-        if get_parallel().dcp_enabled:
+        if get_attn_backend().dcp_size > 1:
             return False
         if self.use_deep_gemm_bmm:
             return False
@@ -320,7 +320,7 @@ class DeepseekMLAForwardMixin:
             return None
         if get_is_capture_mode():
             return None
-        if get_parallel().dcp_enabled:
+        if get_attn_backend().dcp_size > 1:
             return None
         # Kernel shape constraints (tl.arange / tl.dot / block tiling).  K
         # (qk_nope_head_dim) needs only K % 16 == 0 and K <= 256: power-of-2
@@ -447,7 +447,7 @@ class DeepseekMLAForwardMixin:
                     # full-head Q from the gathered weight (skips Q all-gather)
                     q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
                         -1,
-                        self.num_local_heads * get_parallel().attn_dcp_size,
+                        self.num_local_heads * get_attn_backend().dcp_size,
                         self.qk_head_dim,
                     )
                 else:
@@ -539,7 +539,7 @@ class DeepseekMLAForwardMixin:
                     hidden_states, self.q_b_proj_qrep_weight
                 ).view(
                     -1,
-                    self.num_local_heads * get_parallel().attn_dcp_size,
+                    self.num_local_heads * get_attn_backend().dcp_size,
                     self.qk_head_dim,
                 )
             else:
@@ -727,7 +727,8 @@ class DeepseekMLAForwardMixin:
 
         # Decode and DSA TP-prefill gather Q and reduce partial attention with
         # LSE. DSA CP-prefill (like dense MLA prefill) gathers KV instead.
-        if get_parallel().dcp_enabled:
+        # Role-aware: replicated drafts keep dcp_size=1 and skip these paths.
+        if get_attn_backend().dcp_size > 1:
             if is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
@@ -879,7 +880,7 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
-        if self.use_dsa and get_parallel().dcp_enabled:
+        if self.use_dsa and get_attn_backend().dcp_size > 1:
             _zero_dsa_dcp_padding(attn_output, forward_batch)
 
         # correct attn_output with respect to lse from other ranks
@@ -892,7 +893,7 @@ class DeepseekMLAForwardMixin:
             )
             attn_output = attn_output.view(
                 -1,
-                self.num_local_heads * get_parallel().attn_dcp_size,
+                self.num_local_heads * get_attn_backend().dcp_size,
                 self.kv_lora_rank,
             )
             if get_in_autotune_dummy_run():

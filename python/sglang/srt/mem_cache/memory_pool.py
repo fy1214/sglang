@@ -3895,6 +3895,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        dcp_replicated: bool = False,
     ):
         self.size = size
         self.dtype = dtype
@@ -3980,6 +3981,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                dcp_replicated=dcp_replicated,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -4511,11 +4513,18 @@ class MLATokenToKVPool(KVCache):
     # `kernel_page_blocks`: that is `layer_num`, so a rank owning one
     # full-attention layer is translated with blocks_per_page 1.
     write_loc_is_dcp_resolved = False
+    # DSA draft pools opt into replication: they store the full logical span
+    # and must not apply the target owner-shard write rule.
+    dcp_replicated = False
 
     @property
     def _write_loc_dcp_span(self) -> int:
         """How many logical ids one stored row spans in the write-loc space."""
-        return 1 if self.write_loc_is_dcp_resolved else get_parallel().attn_dcp_size
+        return (
+            1
+            if self.write_loc_is_dcp_resolved or self.dcp_replicated
+            else get_parallel().attn_dcp_size
+        )
 
     def _scatter_mla_rows(
         self,
@@ -4524,7 +4533,7 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        if self.write_loc_is_dcp_resolved:
+        if self.write_loc_is_dcp_resolved or self.dcp_replicated:
             set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
         else:
             set_mla_kv_buffer_dcp_sharded_triton(
@@ -4891,6 +4900,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
+        dcp_replicated: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -4912,6 +4922,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
+        self.dcp_replicated = dcp_replicated
         self.index_head_dim = index_head_dim
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
@@ -4920,7 +4931,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if index_buf_size is None:
             index_buf_size = size
             parallel = get_parallel()
-            if parallel.dcp_enabled:
+            # Replicated drafts already pass a full-logical `size`; do not
+            # widen the indexer a second time by attn_dcp_size.
+            if parallel.dcp_enabled and not dcp_replicated:
                 # IndexKeyCache computes num_pages as
                 # (index_buf_size + page_size + 1) // page_size, which already
                 # adds one physical page. Subtract it here so the final capacity

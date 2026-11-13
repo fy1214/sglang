@@ -422,14 +422,15 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         parallel = get_parallel()
-        self.dcp_enabled = parallel.dcp_enabled
-        self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
-        self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
+        # Draft workers keep a local span (dcp_size=1); targets use the group.
+        self._init_dcp(model_runner.is_draft_worker)
+        self.dcp_enabled = self.dcp_size > 1
+        # MHA one-shot does not yet handle sharded target / replicated draft KV.
+        self.supports_mha_one_shot: bool = not self.dcp_enabled
         decode_q_heads = self.num_q_heads
         if parallel.enable_cp_decode_attn_tp:
             decode_q_heads //= parallel.attn_cp_size
@@ -538,11 +539,16 @@ class DeepseekSparseAttnBackend(
             if self.hisparse_coordinator is not None:
                 raise ValueError("DSA with DCP does not support HiSparse.")
             if is_cuda() and model_runner.server_args.speculative_algorithm is not None:
-                raise ValueError(
-                    "DSA with flashmla_kv DCP does not currently support "
-                    "speculative decoding on CUDA. Disable speculative decoding "
-                    "or set --dcp-size 1."
-                )
+                algo = model_runner.server_args.speculative_algorithm.upper()
+                topk = model_runner.server_args.speculative_eagle_topk
+                if algo not in ("EAGLE", "NEXTN") or topk not in (None, 1):
+                    raise ValueError(
+                        "DSA with flashmla_kv DCP supports EAGLE/NEXTN only with "
+                        "--speculative-eagle-topk 1; got "
+                        f"algorithm={model_runner.server_args.speculative_algorithm!r}, "
+                        f"topk={topk!r}. Disable speculative decoding or set "
+                        "--dcp-size 1."
+                    )
             if model_runner.server_args.enable_dp_attention:
                 # Keep each DCP group inside one attention-DP shard so the
                 # replicated indexer sees identical requests group-wide.
