@@ -53,9 +53,12 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     ):
         raise ValueError("CP/TP group sharing only supports native MTP with top-k 1.")
 
+    # DCP is intentionally allowed: persistent MLA KV uses the existing
+    # DCP stripe write (`set_mla_kv_buffer_dcp_sharded_*`) and CP extend
+    # temporarily materializes full KV into `dcp_kv_buffer` (#36990 CP-DCP).
+    # Prefill still shards compute via CP; KDA keeps SumGroup.TP under sharing.
     unsupported = {
         "enable-dsa-cache-layer-split": cfg.enable_dsa_cache_layer_split,
-        "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
         "disaggregation-mode": cfg.disaggregation_mode != "null",

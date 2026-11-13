@@ -106,6 +106,11 @@ def handle_context_parallelism(server_args: Any):
             "--cp-strategy must be set when --enable-prefill-cp is enabled."
         )
 
+    if cfg.enable_prefill_cp and cfg.dcp_size > 1 and cfg.cp_strategy != "interleave":
+        raise ValueError(
+            "DCP with prefill CP currently supports only --cp-strategy interleave."
+        )
+
     view = resolved_view(server_args)
     if view.attn_cp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size

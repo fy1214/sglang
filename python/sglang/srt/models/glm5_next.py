@@ -23,9 +23,11 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention import vision_utils
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
@@ -81,6 +83,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -967,14 +970,24 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states, forward_batch, capture=capture_output
         )
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-            input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
-            prev_topk_indices=prev_topk_indices,
+        # Mirror DeepseekV2DecoderLayer for MLA layers only. Linear/GDN layers
+        # have no decode-attn-tp hook; under CP-TP sharing, MLA decode (and
+        # short non-CP extend) must slice Q/O/absorb weights before DCP
+        # Q-gather, else full heads * dcp_size overflows FlashMLA (64*8 -> 512).
+        attn_tp_cm = (
+            nullcontext()
+            if self.is_linear_attn
+            else self.self_attn.maybe_use_decode_attn_tp(forward_batch)
         )
+        with attn_tp_cm:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
+                prev_topk_indices=prev_topk_indices,
+            )
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
@@ -1501,6 +1514,53 @@ class Glm5NextForConditionalGeneration(nn.Module):
             f"Only 1 fused shared expert is supported for {type(self).__name__}"
         )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+
+    def prepare_context_parallel_metadata_for_dcp(
+        self,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        seq_lens_sum: int,
+        kv_buffer_shape: torch.Size,
+        kv_cache_dtype,
+        kv_cache_device,
+        create_chunked_prefix_cache_kv_indices_fn,
+    ):
+        """Allocate the temporary gathered-KV buffer for DSA Prefill-CP + DCP.
+
+        Eager runner only calls this when the top-level model exposes the hook.
+        DeepseekV2ForCausalLM already has it; Glm5Next must mirror it or a full
+        chunk CP extend dies with "DSA CP+DCP prefill requires a gathered KV
+        buffer" (short warmup may skip CP and never hit this path).
+        """
+        kv_buffer_token_padding = 1
+        if is_deepseek_dsa(self.config):
+            # DSA TP+DCP uses Q gather and does not need a temporary KV view.
+            # CP+DCP gathers KV into a temporary buffer whose row layout and
+            # dtype match the token-to-KV pool values supplied by the caller.
+            if not (is_dsa_enable_prefill_cp() and get_parallel().attn_cp_size > 1):
+                return None
+            token_to_kv_pool = get_token_to_kv_pool()
+            # FlashMLA reshapes the flat gathered storage into physical pages.
+            # Logical DCP indices cover only the valid rows; padding is storage-only.
+            kv_buffer_token_padding = token_to_kv_pool.page_size
+        return prepare_decode_context_parallel_metadata(
+            seq_lens=seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens_sum=seq_lens_sum,
+            kv_buffer_shape=kv_buffer_shape,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_device=kv_cache_device,
+            create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+            kv_buffer_token_padding=kv_buffer_token_padding,
+        )
 
     def wants_prefill_autotune(self) -> bool:
         backend = get_moe_runner_backend()

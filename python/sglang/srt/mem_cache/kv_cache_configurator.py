@@ -693,12 +693,18 @@ class KVCacheConfigurator:
             if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
 
+        # MLA unified-mamba full subpool uses MLASubPoolSpec (latent dim), not
+        # GQA head sharding. Avoid get_num_kv_heads under CP-sharing+DCP.
+        if self.use_mla_backend:
+            unified_head_num = 1
+        else:
+            unified_head_num = self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            )
         bundle = init_unified_mamba_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-            ),
+            head_num=unified_head_num,
             head_dim=self.model_config.head_dim,
             page_size=self.page_size,
             start_layer=self.layer_info.start_layer,
@@ -1421,7 +1427,9 @@ class KVCacheConfigurator:
         PoolCls = current_platform.get_dsa_kv_pool_cls()
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
+            # DSA kernels keep the physical page size even when a replicated
+            # DCP draft uses a wider virtual location space.
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -1654,7 +1662,9 @@ class KVCacheConfigurator:
             ]
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
+            # DSA kernels keep the physical page size even when a replicated
+            # DCP draft uses a wider virtual location space.
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -1936,13 +1946,21 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
             )
+        # MLA/DSA latent KV is a single head `(tokens, 1, kv_dim)`; HybridLinearKVPool
+        # does not forward head_num into MLATokenToKVPool/DSATokenToKVPool. Calling
+        # get_num_kv_heads here is GQA leftover and divides by zero under CP-sharing
+        # (attn_tp_size=1, attn_dcp_size>1). Keep the GQA path for non-MLA hybrids.
+        if self.use_mla_backend:
+            head_num = 1
+        else:
+            head_num = self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            )
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-            ),
+            head_num=head_num,
             head_dim=self.model_config.head_dim,
             # if draft worker, we only need 1 attention layer's kv pool
             full_attention_layer_ids=full_attention_layer_ids,

@@ -1434,10 +1434,10 @@ class TestContextParallelServerArgs(CustomTestCase):
             attn_cp_size=1,
             tp_size=1,
             dp_size=1,
+            dcp_size=1,
             moe_dp_size=1,
             ep_size=1,
             pp_size=1,
-            dcp_size=1,
             enable_aiter_allreduce_fusion=False,
         )
         defaults.update(overrides)
@@ -1498,6 +1498,106 @@ class TestContextParallelServerArgs(CustomTestCase):
 
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
+
+    def test_dcp_prefill_cp_rejects_zigzag(self):
+        server_args = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="zigzag",
+            attn_cp_size=2,
+            tp_size=2,
+            dcp_size=2,
+        )
+        for cp_v2 in (False, True):
+            with (
+                self.subTest(cp_v2=cp_v2),
+                envs.SGLANG_ENABLE_CP_V2.override(cp_v2),
+                self.assertRaisesRegex(ValueError, "--cp-strategy interleave"),
+            ):
+                handle_context_parallelism(server_args)
+
+    def test_dcp_cp_strategy_validation_preserves_supported_configs(self):
+        for dcp_size, enable_prefill_cp, cp_strategy in (
+            (2, True, "interleave"),
+            (1, True, "zigzag"),
+            (2, False, None),
+        ):
+            with self.subTest(
+                dcp_size=dcp_size,
+                enable_prefill_cp=enable_prefill_cp,
+                cp_strategy=cp_strategy,
+            ):
+                server_args = self._new_cp_args(
+                    enable_prefill_cp=enable_prefill_cp,
+                    cp_strategy=cp_strategy,
+                    attn_cp_size=2 if enable_prefill_cp else 1,
+                    tp_size=2,
+                    dcp_size=dcp_size,
+                )
+                handle_context_parallelism(server_args)
+                self.assertEqual(is_cp_enabled(), enable_prefill_cp)
+
+    def test_registered_cp_legacy_args_map_to_unified_strategy(self):
+        cases = [
+            (
+                "deepseek_v3_mla_cp",
+                dict(enable_prefill_context_parallel=True),
+                "zigzag",
+                "in-seq-split",
+                False,
+                True,
+            ),
+            (
+                "qwen3_gqa_cp",
+                dict(
+                    enable_prefill_context_parallel=True,
+                    tp_size=4,
+                    attn_cp_size=2,
+                ),
+                "zigzag",
+                "in-seq-split",
+                False,
+                True,
+            ),
+            (
+                "deepseek_v32_dsa_in_seq_split",
+                dict(
+                    enable_dsa_prefill_context_parallel=True,
+                    dsa_prefill_cp_mode="in-seq-split",
+                    tp_size=8,
+                    dp_size=2,
+                    attn_cp_size=4,
+                ),
+                "zigzag",
+                "in-seq-split",
+                True,
+                False,
+            ),
+            (
+                "deepseek_v32_dsa_round_robin_split",
+                dict(
+                    enable_dsa_prefill_context_parallel=True,
+                    tp_size=8,
+                    attn_cp_size=8,
+                ),
+                "interleave",
+                "round-robin-split",
+                True,
+                False,
+            ),
+            (
+                "deepseek_v4_flash_fp4_b200_dsa_round_robin_split",
+                dict(
+                    enable_dsa_prefill_context_parallel=True,
+                    dsa_prefill_cp_mode="round-robin-split",
+                    tp_size=4,
+                    attn_cp_size=4,
+                ),
+                "interleave",
+                "round-robin-split",
+                True,
+                False,
+            ),
+        ]
 
 
 class TestFlashinferA2ADispatchType(CustomTestCase):
