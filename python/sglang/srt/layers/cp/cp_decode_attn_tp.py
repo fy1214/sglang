@@ -34,6 +34,9 @@ CP_DECODE_ATTN_TP_SUPPORTED_ARCHS: Tuple[str, ...] = (
     # GLM-5.x (inherits DeepseekV2 attention; DSA path)
     "GlmMoeDsaForCausalLM",
     "GlmMoeDsaForCausalLMNextN",
+    # GLM-5.3-Flash hybrid (DSA MLA via DeepseekV2AttentionMLA; CP-TP sharing)
+    "Glm5NextForConditionalGeneration",
+    "Glm5NextForConditionalGenerationNextN",
 )
 
 _global_cp_decode_attn_tp_ctx: CpDecodeAttnTpContext | None = None
