@@ -650,11 +650,16 @@ class Glm5NextLinearAttention(nn.Module):
             cp_sequence_to_interleave_order,
             is_interleave_extend,
         )
+        from sglang.srt.layers.cp.kda_kcp import use_zigzag_kcp
         from sglang.srt.layers.cp.zigzag import (
             cp_sequence_to_zigzag_gathered_order,
             cp_zigzag_gathered_to_sequence_order,
             is_zigzag_extend,
         )
+
+        # KCP path keeps local zigzag early|late shards (no full-sequence
+        # chrono restore / AG'd activation replay inside KDA).
+        kcp = use_zigzag_kcp(forward_batch)
 
         # Layer-boundary AG stacks equal rank shards; KDA needs chronological
         # token order. Interleave and zigzag each restore (and later undo) that
@@ -664,7 +669,7 @@ class Glm5NextLinearAttention(nn.Module):
             hidden_states = cp_interleave_to_sequence_order(
                 hidden_states, forward_batch
             )
-        elif is_zigzag_extend(forward_batch):
+        elif is_zigzag_extend(forward_batch) and not kcp:
             hidden_states = cp_zigzag_gathered_to_sequence_order(
                 hidden_states, forward_batch
             )
@@ -696,7 +701,7 @@ class Glm5NextLinearAttention(nn.Module):
         out = self.o_proj(core_attn_out)[0]
         if is_interleave_extend(forward_batch):
             return cp_sequence_to_interleave_order(out, forward_batch, gathered_rows)
-        if is_zigzag_extend(forward_batch):
+        if is_zigzag_extend(forward_batch) and not kcp:
             return cp_sequence_to_zigzag_gathered_order(
                 out, forward_batch, gathered_rows
             )
@@ -984,6 +989,15 @@ class Glm5NextDecoderLayer(nn.Module):
     ):
         hidden_states_orig = residual_access.buffer(hidden_states)
 
+        # Zigzag KCP: keep KDA on local early|late shards — skip layer-boundary
+        # activation AG before attention and RS after (summary AG lives inside KCP).
+        from sglang.srt.layers.cp.kda_kcp import use_zigzag_kcp
+
+        if self.is_linear_attn and use_zigzag_kcp(forward_batch):
+            forward_batch.sglang_kda_kcp_local = True
+        elif hasattr(forward_batch, "sglang_kda_kcp_local"):
+            forward_batch.sglang_kda_kcp_local = False
+
         hidden_states = self.attn_boundary.prepare(
             hidden_states, forward_batch, capture=capture_output
         )
@@ -1003,7 +1017,12 @@ class Glm5NextDecoderLayer(nn.Module):
         get_attn_tp_context().clear_attn_inputs()
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        # Keep sglang_kda_kcp_local through ffn_boundary.prepare: that step owns
+        # the post-attn RS. Clearing earlier makes RS see local KCP shards and
+        # crash (input size != output * world).
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        if hasattr(forward_batch, "sglang_kda_kcp_local"):
+            forward_batch.sglang_kda_kcp_local = False
 
         if isinstance(self.mlp, Glm5NextMLP):
             gemm_output_zero_allocator = None

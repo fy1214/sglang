@@ -807,6 +807,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if forward_batch.forward_mode.is_target_verify():
             return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
 
+        from sglang.srt.layers.cp.kda_kcp import use_zigzag_kcp
+
+        if use_zigzag_kcp(forward_batch):
+            return self._forward_extend_zigzag_kcp(
+                layer, forward_batch, mixed_qkv, a, b, **kwargs
+            )
+
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
@@ -955,6 +962,149 @@ class KDAAttnBackend(MambaAttnBackendBase):
             self.accept_lens_pool[slots] = 1
 
         return core_attn_out
+
+    def _forward_extend_zigzag_kcp(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        a: torch.Tensor,
+        b: torch.Tensor,
+        **kwargs,
+    ):
+        """Zigzag KCP prefill: per-segment conv → summary → AG → merge → scan.
+
+        Driven by ``HybridPCPLayout`` / ``KcpPlan`` (bs>=1). Short-conv halo
+        follows vLLM #59304: AG segment tails → per-slot windows → causal conv.
+        Still rejects nonempty prefix / mamba-track / spec.
+        """
+        from sglang.srt.layers.cp.kda_kcp import (
+            all_gather_conv_tails_batch,
+            conv_halo_size,
+            final_conv_windows_batch,
+            initial_conv_window_for_request_slot,
+            local_zigzag_segment_lengths,
+            pack_local_conv_tails_batch,
+            plan_for_forward_batch,
+            run_zigzag_kcp_from_plan,
+        )
+
+        if self.forward_metadata.has_mamba_track_mask:
+            raise NotImplementedError(
+                "zigzag KCP rejects mamba radix track/prefix buffer"
+            )
+        if forward_batch.extend_prefix_lens is not None and bool(
+            (forward_batch.extend_prefix_lens > 0).any()
+        ):
+            raise NotImplementedError("zigzag KCP rejects nonempty extend prefix")
+
+        cache_indices = self.forward_metadata.mamba_cache_indices
+        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        # Layout expected by causal_conv1d_fn: [slots, C, halo].
+        conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
+        ssm_states = mamba_cache_params.temporal
+
+        early_lens, late_lens = local_zigzag_segment_lengths(forward_batch)
+        halo = conv_halo_size(layer.conv_weights)
+        plan = plan_for_forward_batch(forward_batch, halo, device=mixed_qkv.device)
+        layout = plan.layout
+        local_tokens = layout.num_prefill_tokens
+        if mixed_qkv.shape[0] < local_tokens:
+            raise RuntimeError(
+                f"KCP local rows {mixed_qkv.shape[0]} < plan tokens {local_tokens}"
+            )
+        mixed_qkv = mixed_qkv[:local_tokens]
+        a = a[:, :local_tokens] if a.ndim >= 2 else a[:local_tokens]
+        b = b[:, :local_tokens] if b.ndim >= 2 else b[:local_tokens]
+
+        # --- Conv halo (vLLM-style tails AG + per-segment windows, bs>=1) ---
+        local_tails = pack_local_conv_tails_batch(
+            mixed_qkv, early_lens, late_lens, halo
+        )
+        slot_tails = all_gather_conv_tails_batch(local_tails)  # [N, 2C, C, halo]
+
+        num_segments = layout.num_segments
+        # Row 0 unused (NULL); segments use 1..L
+        window_buf = conv_states.new_zeros(num_segments + 1, conv_states.shape[1], halo)
+        conv_pieces = []
+        for seg_i, (req_id, slot_id, local_start) in enumerate(
+            zip(
+                layout.segment_request,
+                layout.segment_slot,
+                layout.segment_local_start,
+            )
+        ):
+            length = int(layout.scan_cu[seg_i + 1] - layout.scan_cu[seg_i])
+            piece = mixed_qkv[local_start : local_start + length]
+            if length == 0:
+                conv_pieces.append(piece)
+                continue
+            win = initial_conv_window_for_request_slot(slot_tails, req_id, slot_id)
+            scratch_row = seg_i + 1
+            window_buf[scratch_row].copy_(win)
+            cu = torch.tensor([0, length], device=mixed_qkv.device, dtype=torch.int32)
+            has_init = torch.tensor(
+                [slot_id > 0], dtype=torch.bool, device=mixed_qkv.device
+            )
+            conv_out = causal_conv1d_fn(
+                piece.transpose(0, 1),
+                layer.conv_weights,
+                layer.bias,
+                activation="silu",
+                conv_states=window_buf,
+                has_initial_state=has_init,
+                cache_indices=torch.tensor(
+                    [scratch_row], device=mixed_qkv.device, dtype=torch.int32
+                ),
+                query_start_loc=cu,
+                seq_lens_cpu=[length],
+            ).transpose(0, 1)
+            conv_pieces.append(conv_out)
+        if not conv_pieces:
+            raise RuntimeError("zigzag KCP conv produced no local segments")
+        qkv = torch.cat(conv_pieces, dim=0)
+
+        # Publish request-final conv windows into the real cache (all ranks).
+        final_wins = final_conv_windows_batch(slot_tails, layout.slot_lens)
+        slots = cache_indices.reshape(-1)[: layout.num_prefill_reqs]
+        conv_states[slots] = final_wins.to(dtype=conv_states.dtype)
+
+        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+
+        if a.ndim == 3:
+            a = a.unflatten(-1, (-1, layer.head_k_dim))
+        if a.ndim == 2:
+            a = a.unsqueeze(0)
+        if b.ndim == 2:
+            b = b.unsqueeze(0)
+
+        scale = layer.head_k_dim**-0.5
+        g = a
+        lb = getattr(layer, "lower_bound", None)
+        if lb is not None and not isinstance(lb, float):
+            lb = float(lb)
+
+        core, final_states = run_zigzag_kcp_from_plan(
+            q,
+            k,
+            v,
+            g,
+            b,
+            plan,
+            scale=scale,
+            s_base=None,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            lower_bound=lb if lb is not None else -5.0,
+        )
+        # Commit per-request final states into the recurrent cache.
+        if final_states is not None:
+            ssm_states[slots] = final_states.to(ssm_states.dtype)
+
+        return core
 
     def _forward_target_verify(
         self,

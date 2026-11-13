@@ -405,6 +405,10 @@ def attn_cp_take_back_output(
 ):
     """DSA and MLA CP: this rank's shard of a complete output gathered in
     equal shards over the attention-CP group."""
+    from sglang.srt.layers.cp.kda_kcp import skip_attn_cp_activation_exchange
+
+    if skip_attn_cp_activation_exchange(forward_batch):
+        return hidden_states, residual
     parallel = get_parallel()
     shard = hidden_states.tensor_split(parallel.attn_cp_size)[parallel.attn_cp_rank]
     return shard, residual
@@ -417,6 +421,10 @@ def attn_cp_reduce_scatter_output(
 ):
     """DSA and MLA CP: sum the FFN output over the attention-CP group and
     keep this rank's shard."""
+    from sglang.srt.layers.cp.kda_kcp import skip_attn_cp_activation_exchange
+
+    if skip_attn_cp_activation_exchange(forward_batch):
+        return hidden_states, residual
     return attn_cp_interleave_reduce_scatter(hidden_states), residual
 
 

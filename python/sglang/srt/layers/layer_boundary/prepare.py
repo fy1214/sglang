@@ -470,6 +470,11 @@ def _then_attn_cp_gather(
     hidden_states, residual = gather(
         hidden_states, residual, forward_batch, norm, update=update, cache=cache, **call
     )
+    # Zigzag KDA KCP keeps activations local; summary AG replaces this gather.
+    from sglang.srt.layers.cp.kda_kcp import skip_attn_cp_activation_exchange
+
+    if skip_attn_cp_activation_exchange(forward_batch):
+        return hidden_states, residual
     return attn_cp_interleave_gather(hidden_states), residual
 
 

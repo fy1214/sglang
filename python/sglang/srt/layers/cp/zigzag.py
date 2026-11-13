@@ -68,6 +68,7 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     per_rank_actual_token: Optional[List[int]] = None
     max_rank_len: Optional[List[int]] = None
     per_rank_logical_token: Optional[List[int]] = None
+    moe_local_token_count: Optional[Any] = None  # PR43277 remainder
 
     # Per-sequence FlashAttention tensors (shape [bs] or [bs + 1]).
     kv_len_prev_tensor: Optional[Any] = None
@@ -214,6 +215,21 @@ def cp_sequence_to_zigzag_gathered_order(hidden_states, forward_batch, gathered_
 class ZigzagCPStrategy(ContextParallelStrategy):
     name = "zigzag"
     kind = ContextParallelStrategyKind.ZIGZAG
+
+    def moe_num_token_non_padded(self, forward_batch):
+        """Local MoE dispatch consumes the logical prefix of a padded shard."""
+        # PR43277 remainder
+        metadata = forward_batch.attn_cp_metadata
+        if getattr(metadata, "moe_local_token_count", None) is None:
+            lengths = metadata.per_rank_logical_token or metadata.per_rank_actual_token
+            import torch
+
+            metadata.moe_local_token_count = torch.tensor(
+                lengths[self.cp_rank],
+                dtype=torch.int32,
+                device=forward_batch.input_ids.device,
+            )
+        return metadata.moe_local_token_count
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
@@ -498,6 +514,10 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             if hasattr(input_, "new_empty"):
                 return input_.new_empty(0, *input_.shape[1:])
             return input_[:0]
+        # local_q_indices follows input_ids / metadata device; the tensor being
+        # sliced (e.g. CPU expand buffers in DSA metadata) may differ.
+        if hasattr(input_, "device") and indices.device != input_.device:
+            indices = indices.to(device=input_.device)
         return input_[indices]
 
     def shard_per_request(
@@ -505,13 +525,24 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         extend_seqs_cpu: List[int],
         extend_seqs: Any,
     ):
-        """Per-request local q lengths for this zigzag rank (Python first cut)."""
-        counts = zigzag_rows_per_request(extend_seqs_cpu, self.cp_rank, self.cp_size)
-        bs_idx_cpu = [i for i, q_len in enumerate(counts) if q_len > 0]
-        q_lens_cpu = [q_len for q_len in counts if q_len > 0]
-        q_lens = torch.tensor(
-            q_lens_cpu, device=extend_seqs.device, dtype=extend_seqs.dtype
-        )
+        """Local Q segments in early-all / late-all order (PR #43277).
+
+        Zigzag owns block ``r`` then block ``2C-1-r``. DSA metadata must keep
+        those as separate Q segments with repeated request IDs; merging them
+        into one contiguous length per request makes late tokens attend with
+        early causal bounds.
+        """
+        # PR43277_ZIGZAG_DSA_SEGMENTS
+        q_lens_cpu: List[int] = []
+        bs_idx_cpu: List[int] = []
+        for block in (self.cp_rank, 2 * self.cp_size - 1 - self.cp_rank):
+            for request, length in enumerate(extend_seqs_cpu):
+                base, remainder = divmod(int(length), 2 * self.cp_size)
+                count = base + int(block < remainder)
+                if count:
+                    q_lens_cpu.append(count)
+                    bs_idx_cpu.append(request)
+        q_lens = extend_seqs.new_tensor(q_lens_cpu)
         bs_idx = torch.tensor(bs_idx_cpu, device=extend_seqs.device, dtype=torch.int32)
         return q_lens_cpu, q_lens, bs_idx_cpu, bs_idx
 
@@ -626,16 +657,21 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         k_nope: Any,
         k_rope: Any,
         stream: Optional[Any] = None,
-    ) -> None:
+    ) -> Any:
+        # Match InterleaveCPStrategy: DSA ``prepare_kv_for_attention`` unpacks
+        # the returned (k_nope, k_rope) pair. Writing only the MLA KV pool and
+        # returning None breaks absorb-prepare unpacking.
+        del layer
         kv_lora_rank = k_nope.shape[-1]
-        latent = torch.cat([k_nope, k_rope], dim=-1).contiguous()
-        latent_full = self.gather_kv_cache(latent, forward_batch, stream=stream)
-        get_token_to_kv_pool().set_mla_kv_buffer(
-            layer,
-            forward_batch.out_cache_loc,
-            latent_full[..., :kv_lora_rank],
-            latent_full[..., kv_lora_rank:],
+        latent_cache = torch.cat([k_nope, k_rope], dim=-1).squeeze(1)
+        full_latent = self.gather_kv_cache(
+            latent_cache.contiguous(),
+            forward_batch,
+            stream if stream is not None else torch.cuda.current_stream(),
         )
+        k_nope = full_latent[..., :kv_lora_rank].unsqueeze(1)
+        k_rope = full_latent[..., kv_lora_rank:].unsqueeze(1)
+        return k_nope, k_rope
 
     def _all_gather_reorganized(self, x: torch.Tensor, forward_batch):
         meta = forward_batch.attn_cp_metadata
