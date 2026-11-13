@@ -171,7 +171,9 @@ HiCache keeps one widened logical page space across L1 and L2. The controller se
 
 Before H2D or D2H, both index lists keep positions owned by this rank and map `i` to `floor(i / c)`. Transfers cover whole widened pages, and every rank moves its shard independently, with no DCP collective. For Kimi K3 this applies to MLA KV; KDA/Mamba state uses its own request-indexed host pool.
 
-The current scope is MLA L1/L2. L3, LMCache, HiSparse, non-MLA KV host pools, speculative decoding, and PD decode are not supported in this combination.
+With speculative decoding, the draft KV cache is replicated over the widened slots, so it cannot share the target's per-rank host rows. It gets its own host pool that mirrors every logical slot, without translation. This covers EAGLE and NEXTN (MTP) drafts with `--speculative-eagle-topk 1` and a single draft model runner, and DSpark.
+
+The current scope is MLA L1/L2. L3, LMCache, HiSparse, non-MLA KV host pools, other speculative algorithms, and PD decode are not supported in this combination.
 
 ## References
 
