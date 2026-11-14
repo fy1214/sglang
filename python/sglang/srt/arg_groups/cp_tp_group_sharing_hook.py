@@ -61,8 +61,26 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         "enable-dsa-cache-layer-split": cfg.enable_dsa_cache_layer_split,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
-        "disaggregation-mode": cfg.disaggregation_mode != "null",
     }
+    # #43774: allow PD prefill + PCP for Glm5Next (mooncake).
+    # #49089: native MTP/EAGLE topk1 already admitted above.
+    # Decode PD remains blocked; non-Glm5Next still forbids all disaggregation.
+    is_glm5_next = (
+        model.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+    )
+    if is_glm5_next:
+        if cfg.disaggregation_mode != "null":
+            unsupported |= {
+                "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
+                "disaggregation-transfer-backend != mooncake": (
+                    cfg.disaggregation_transfer_backend != "mooncake"
+                ),
+                "pp-size > 1": cfg.pp_size > 1,
+                "dp-size > 1": cfg.dp_size > 1,
+                "ep-size > 1": view.ep_size > 1,
+            }
+    else:
+        unsupported["disaggregation-mode"] = cfg.disaggregation_mode != "null"
     for flag, enabled in unsupported.items():
         if enabled:
             raise ValueError(f"--{flag} is not supported with CP-TP group sharing.")
