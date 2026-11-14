@@ -122,6 +122,11 @@ class KcpPlan:
 
     Summary AG uses physical ``[P, 2, N, ...]`` (part 0 = slot ``rank``,
     part 1 = slot ``2P-1-rank``). Merge walks chronological slots per request.
+
+    Convolution halo (vLLM ``#59304``): each rank packs ``[N*2*halo]`` raw tail
+    rows via ``tail_src_idx``, all-gathers to ``[P*N*2*halo, C]``, then
+    ``halo_idx`` / ``final_halo_idx`` select windows from the prefix pool
+    (first ``N*halo`` rows) plus gathered tails.
     """
 
     layout: HybridPCPLayout
@@ -134,6 +139,10 @@ class KcpPlan:
     # Local segment bookkeeping
     segment_ids: torch.Tensor  # [L] int32 (1..L for conv scratch rows)
     segment_has_initial_state: torch.Tensor  # [L] bool
+    # Conv halo plan (vLLM gather_conv_tails / conv_windows)
+    tail_src_idx: torch.Tensor  # [N*2*halo] int64; -1 if absent
+    halo_idx: torch.Tensor  # [L, halo] int64 pool rows for initial windows
+    final_halo_idx: torch.Tensor  # [N, halo] int64 pool rows for final windows
     # Reusable exchange buffers keyed by shape (summary AG, conv tails)
     buffers: dict = field(default_factory=dict, repr=False)
 
@@ -220,6 +229,60 @@ def build_hybrid_pcp_layout(
     )
 
 
+def _slot_part(slot: int, world: int) -> int:
+    return 0 if slot < world else 1
+
+
+def _slot_owner(slot: int, world: int) -> int:
+    return slot if slot < world else (2 * world - 1 - slot)
+
+
+def _conv_window_pool_rows(
+    n: int,
+    end: int,
+    *,
+    slot_lens_host: Sequence[Sequence[int]],
+    halo: int,
+    n_req: int,
+    world: int,
+) -> List[int]:
+    """Pool rows for request ``n`` covering chronological ``[end-halo, end)``.
+
+    Pool layout matches vLLM ``#59304``: first ``N*halo`` rows are per-request
+    prefix cache columns; remaining rows are rank-major gathered tails
+    ``((owner*N + n)*2 + part)*halo + column`` (right-aligned in each slot).
+    """
+    num_slots = 2 * world
+    rows: List[int] = []
+    for position in range(end - halo, end):
+        if position < 0:
+            rows.append(n * halo + position + halo)
+            continue
+        cum = 0
+        found = False
+        for slot in range(num_slots):
+            length = int(slot_lens_host[n][slot])
+            if position < cum + length:
+                offset = position - cum
+                column = halo - length + offset
+                if column < 0:
+                    raise RuntimeError(
+                        f"conv window column {column} < 0 at n={n} pos={position}"
+                    )
+                owner = _slot_owner(slot, world)
+                part = _slot_part(slot, world)
+                tail = ((owner * n_req + n) * 2 + part) * halo
+                rows.append(n_req * halo + tail + column)
+                found = True
+                break
+            cum += length
+        if not found:
+            raise RuntimeError(
+                f"conv window position {position} past request {n} length {cum}"
+            )
+    return rows
+
+
 def build_kcp_plan(layout: HybridPCPLayout, halo_size: int) -> KcpPlan:
     """Derive per-step KCP indices; cache on ``layout.shared['kcp']``."""
     cached = layout.shared.get("kcp")
@@ -233,15 +296,55 @@ def build_kcp_plan(layout: HybridPCPLayout, halo_size: int) -> KcpPlan:
     world, rank = layout.world, layout.rank
     n_req = layout.num_prefill_reqs
     num_slots = layout.num_slots
+    halo = int(halo_size)
     device = layout.scan_cu_seqlens.device
+    slot_lens_host = [
+        [int(x) for x in layout.slot_lens[n].tolist()] for n in range(n_req)
+    ]
 
     summary_idx: List[int] = []
     segment_has_init: List[bool] = []
-    for n, slot in zip(layout.segment_request, layout.segment_slot):
-        part = 0 if slot < world else 1
-        summary_idx.append((rank * 2 + part) * n_req + n)
-        # First cut: no prefix/mamba initial; always start from zeros / merged.
+    # Local [N, 2, halo] pack destinations → source token in local mixed_qkv.
+    tail_src = [-1] * (n_req * 2 * halo)
+    halo_idx_rows: List[List[int]] = []
+    for seg_i, (n, slot, local_start) in enumerate(
+        zip(
+            layout.segment_request,
+            layout.segment_slot,
+            layout.segment_local_start,
+        )
+    ):
+        part = _slot_part(int(slot), world)
+        summary_idx.append((rank * 2 + part) * n_req + int(n))
+        # Windows always come from the pool (prefix zeros or prior tails).
         segment_has_init.append(True)
+        length = int(layout.scan_cu[seg_i + 1] - layout.scan_cu[seg_i])
+        take = min(halo, length)
+        dest = (int(n) * 2 + part) * halo + halo - take
+        for i in range(take):
+            tail_src[dest + i] = int(local_start) + length - take + i
+        halo_idx_rows.append(
+            _conv_window_pool_rows(
+                int(n),
+                int(layout.segment_start[seg_i]),
+                slot_lens_host=slot_lens_host,
+                halo=halo,
+                n_req=n_req,
+                world=world,
+            )
+        )
+
+    final_halo_idx_rows = [
+        _conv_window_pool_rows(
+            n,
+            int(layout.prefill_lens[n]),
+            slot_lens_host=slot_lens_host,
+            halo=halo,
+            n_req=n_req,
+            world=world,
+        )
+        for n in range(n_req)
+    ]
 
     segment_of_slot = torch.full(
         (n_req, num_slots), -1, dtype=torch.int32, device=device
@@ -251,9 +354,19 @@ def build_kcp_plan(layout: HybridPCPLayout, halo_size: int) -> KcpPlan:
 
     slot_present = layout.slot_lens > 0
     num_segments = layout.num_segments
+    if num_segments == 0:
+        halo_idx = torch.empty(0, halo, dtype=torch.int64, device=device)
+    else:
+        halo_idx = torch.tensor(halo_idx_rows, dtype=torch.int64, device=device)
+    if n_req == 0:
+        final_halo_idx = torch.empty(0, halo, dtype=torch.int64, device=device)
+    else:
+        final_halo_idx = torch.tensor(
+            final_halo_idx_rows, dtype=torch.int64, device=device
+        )
     plan = KcpPlan(
         layout=layout,
-        halo_size=int(halo_size),
+        halo_size=halo,
         summary_idx=torch.tensor(summary_idx, dtype=torch.int64, device=device),
         slot_present=slot_present,
         segment_of_slot=segment_of_slot,
@@ -261,6 +374,9 @@ def build_kcp_plan(layout: HybridPCPLayout, halo_size: int) -> KcpPlan:
         segment_has_initial_state=torch.tensor(
             segment_has_init, dtype=torch.bool, device=device
         ),
+        tail_src_idx=torch.tensor(tail_src, dtype=torch.int64, device=device),
+        halo_idx=halo_idx,
+        final_halo_idx=final_halo_idx,
     )
     layout.shared["kcp"] = plan
     return plan
@@ -678,6 +794,221 @@ def all_gather_conv_tails_batch(local_tails: torch.Tensor) -> torch.Tensor:
         slot_tails[:, r] = rm[r, :, 0]
         slot_tails[:, 2 * cp_size - 1 - r] = rm[r, :, 1]
     return slot_tails
+
+
+# ---------------------------------------------------------------------------
+# Triton conv halo (vLLM #59304 gather_conv_tails / conv_windows)
+# ---------------------------------------------------------------------------
+
+
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _pack_conv_tail_rows(
+        x,
+        source_indices,
+        out,
+        stride_token: tl.int64,
+        stride_channel: tl.constexpr,
+        C: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        channel_tiles: tl.constexpr = tl.cdiv(C, BLOCK)
+        token = (tl.program_id(0) // channel_tiles).to(tl.int64)
+        channel = (tl.program_id(0) % channel_tiles).to(tl.int64) * BLOCK
+        channel += tl.arange(0, BLOCK)
+        source = tl.load(source_indices + token).to(tl.int64)
+        value = tl.load(
+            x + tl.maximum(source, 0) * stride_token + channel * stride_channel,
+            (source >= 0) & (channel < C),
+            other=0.0,
+        )
+        tl.store(out + token * C + channel, value, channel < C)
+
+    @triton.jit
+    def _conv_windows_kernel(
+        conv_state,
+        state_indices,
+        has_initial_state,
+        tails,
+        pool_rows,
+        out,
+        stride_state_slot,
+        stride_state_channel,
+        stride_state_column,
+        stride_out_row,
+        stride_out_channel,
+        stride_out_column,
+        num_prefix_rows,
+        C: tl.constexpr,
+        HALO: tl.constexpr,
+        OUT_BY_SLOT: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0).to(tl.int64)
+        channel = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        mask = channel < C
+        values = ()  # type: tuple
+        for column in tl.static_range(HALO):
+            source = tl.load(pool_rows + row * HALO + column).to(tl.int64)
+            from_prefix = source < num_prefix_rows
+            request = tl.where(from_prefix, source // HALO, 0)
+            slot = tl.load(state_indices + request).to(tl.int64)
+            continued = tl.load(has_initial_state + request).to(tl.int1)
+            prefix = tl.load(
+                conv_state
+                + slot * stride_state_slot
+                + channel * stride_state_channel
+                + (source % HALO) * stride_state_column,
+                mask=mask & from_prefix & continued,
+                other=0.0,
+            )
+            tail = tl.load(
+                tails + tl.maximum(source - num_prefix_rows, 0) * C + channel,
+                mask=mask & (source >= num_prefix_rows),
+                other=0.0,
+            )
+            values += (tl.where(from_prefix, prefix, tail.to(prefix.dtype)),)
+        destination = (
+            tl.load(state_indices + row).to(tl.int64) if OUT_BY_SLOT else row + 1
+        )
+        for column in tl.static_range(HALO):
+            tl.store(
+                out
+                + destination * stride_out_row
+                + channel * stride_out_channel
+                + column * stride_out_column,
+                values[column],
+                mask=mask,
+            )
+
+
+def gather_conv_tails(plan: KcpPlan, qkv: torch.Tensor) -> torch.Tensor:
+    """Pack local tails with Triton and AG to ``[P*N*2*halo, C]`` (vLLM layout)."""
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("gather_conv_tails requires triton")
+    rows = int(plan.tail_src_idx.numel())
+    channels = int(qkv.shape[-1])
+    cp_size = get_parallel().attn_cp_size
+    group = get_parallel().attn_cp_group
+    local = qkv.new_empty(rows, channels)
+    block = 256
+    _pack_conv_tail_rows[(rows * triton.cdiv(channels, block),)](
+        qkv,
+        plan.tail_src_idx,
+        local,
+        qkv.stride(0),
+        qkv.stride(1),
+        channels,
+        BLOCK=block,
+    )
+    scratch = get_ag_scratch(
+        "conv_tails_flat",
+        (cp_size * rows, channels),
+        local.dtype,
+        local.device,
+    )
+    flat = local.contiguous()
+    if hasattr(group, "all_gather_into_tensor"):
+        group.all_gather_into_tensor(scratch, flat)
+        return scratch
+    parts = [torch.empty_like(flat) for _ in range(cp_size)]
+    torch.distributed.all_gather(parts, flat, group=group.device_group)
+    return torch.cat(parts, dim=0)
+
+
+def conv_windows(
+    plan: KcpPlan,
+    tails: torch.Tensor,
+    conv_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    final: bool = False,
+) -> torch.Tensor:
+    """Assemble halo windows from prefix cache + gathered ``tails``.
+
+    Default: segment initial windows as ``[1+L, C, halo]`` (row 0 unused).
+    ``final=True`` writes each request's final window into ``conv_state[slots]``.
+    """
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("conv_windows requires triton")
+    channels = int(conv_state.shape[1])
+    halo = int(plan.halo_size)
+    if conv_state.shape[-1] != halo:
+        raise ValueError(f"conv_state halo {conv_state.shape[-1]} != plan halo {halo}")
+    if tails.shape[-1] != channels or not tails.is_contiguous():
+        raise ValueError("tails must be contiguous [..., C]")
+    n_req = plan.layout.num_prefill_reqs
+    if final:
+        rows, out = plan.final_halo_idx, conv_state
+    else:
+        rows = plan.halo_idx
+        shape = (plan.layout.num_segments + 1, channels, halo)
+        if conv_state.stride(-1) == 1:
+            out = conv_state.new_empty(shape)
+        else:
+            out = conv_state.new_empty(shape[0], shape[2], shape[1]).transpose(1, 2)
+    if rows.shape[0] == 0:
+        return out
+    block = 1024
+    _conv_windows_kernel[(rows.shape[0], triton.cdiv(channels, block))](
+        conv_state,
+        state_indices,
+        plan.layout.prefill_has_initial_state,
+        tails,
+        rows,
+        out,
+        *conv_state.stride(),
+        *out.stride(),
+        n_req * halo,
+        C=channels,
+        HALO=halo,
+        OUT_BY_SLOT=final,
+        BLOCK=block,
+    )
+    return out
+
+
+def run_local_kcp_conv(
+    plan: KcpPlan,
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_bias: Optional[torch.Tensor],
+    conv_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+) -> torch.Tensor:
+    """One batched short-conv over local zigzag segments (vLLM ``_forward_kcp``).
+
+    Packs and all-gathers tails, builds initial windows, runs ``causal_conv1d_fn`` once
+    over ``scan_cu_seqlens``, then publishes request-final windows into
+    ``conv_states[cache_indices]``.
+    """
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
+
+    layout = plan.layout
+    slots = cache_indices.reshape(-1)[: layout.num_prefill_reqs]
+    tails = gather_conv_tails(plan, mixed_qkv)
+    windows = conv_windows(plan, tails, conv_states, slots, final=False)
+    if layout.num_segments == 0:
+        conv_windows(plan, tails, conv_states, slots, final=True)
+        return mixed_qkv.new_empty(0, mixed_qkv.shape[-1])
+    seq_lens_cpu = [
+        int(layout.scan_cu[i + 1] - layout.scan_cu[i])
+        for i in range(layout.num_segments)
+    ]
+    qkv = causal_conv1d_fn(
+        mixed_qkv.transpose(0, 1),
+        conv_weights,
+        conv_bias,
+        activation="silu",
+        conv_states=windows,
+        has_initial_state=plan.segment_has_initial_state,
+        cache_indices=plan.segment_ids,
+        query_start_loc=layout.scan_cu_seqlens,
+        seq_lens_cpu=seq_lens_cpu,
+    ).transpose(0, 1)
+    conv_windows(plan, tails, conv_states, slots, final=True)
+    return qkv
 
 
 def initial_conv_window_for_slot(

@@ -979,13 +979,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         Still rejects nonempty prefix / mamba-track / spec.
         """
         from sglang.srt.layers.cp.kda_kcp import (
-            all_gather_conv_tails_batch,
             conv_halo_size,
-            final_conv_windows_batch,
-            initial_conv_window_for_request_slot,
-            local_zigzag_segment_lengths,
-            pack_local_conv_tails_batch,
             plan_for_forward_batch,
+            run_local_kcp_conv,
             run_zigzag_kcp_from_plan,
         )
 
@@ -1004,7 +1000,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
         ssm_states = mamba_cache_params.temporal
 
-        early_lens, late_lens = local_zigzag_segment_lengths(forward_batch)
         halo = conv_halo_size(layer.conv_weights)
         plan = plan_for_forward_batch(forward_batch, halo, device=mixed_qkv.device)
         layout = plan.layout
@@ -1017,57 +1012,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
         a = a[:, :local_tokens] if a.ndim >= 2 else a[:local_tokens]
         b = b[:, :local_tokens] if b.ndim >= 2 else b[:local_tokens]
 
-        # --- Conv halo (vLLM-style tails AG + per-segment windows, bs>=1) ---
-        local_tails = pack_local_conv_tails_batch(
-            mixed_qkv, early_lens, late_lens, halo
+        # Triton pack/AG tails + windows + one batched causal_conv1d (vLLM #59304).
+        qkv = run_local_kcp_conv(
+            plan,
+            mixed_qkv,
+            layer.conv_weights,
+            layer.bias,
+            conv_states,
+            cache_indices,
         )
-        slot_tails = all_gather_conv_tails_batch(local_tails)  # [N, 2C, C, halo]
-
-        num_segments = layout.num_segments
-        # Row 0 unused (NULL); segments use 1..L
-        window_buf = conv_states.new_zeros(num_segments + 1, conv_states.shape[1], halo)
-        conv_pieces = []
-        for seg_i, (req_id, slot_id, local_start) in enumerate(
-            zip(
-                layout.segment_request,
-                layout.segment_slot,
-                layout.segment_local_start,
-            )
-        ):
-            length = int(layout.scan_cu[seg_i + 1] - layout.scan_cu[seg_i])
-            piece = mixed_qkv[local_start : local_start + length]
-            if length == 0:
-                conv_pieces.append(piece)
-                continue
-            win = initial_conv_window_for_request_slot(slot_tails, req_id, slot_id)
-            scratch_row = seg_i + 1
-            window_buf[scratch_row].copy_(win)
-            cu = torch.tensor([0, length], device=mixed_qkv.device, dtype=torch.int32)
-            has_init = torch.tensor(
-                [slot_id > 0], dtype=torch.bool, device=mixed_qkv.device
-            )
-            conv_out = causal_conv1d_fn(
-                piece.transpose(0, 1),
-                layer.conv_weights,
-                layer.bias,
-                activation="silu",
-                conv_states=window_buf,
-                has_initial_state=has_init,
-                cache_indices=torch.tensor(
-                    [scratch_row], device=mixed_qkv.device, dtype=torch.int32
-                ),
-                query_start_loc=cu,
-                seq_lens_cpu=[length],
-            ).transpose(0, 1)
-            conv_pieces.append(conv_out)
-        if not conv_pieces:
-            raise RuntimeError("zigzag KCP conv produced no local segments")
-        qkv = torch.cat(conv_pieces, dim=0)
-
-        # Publish request-final conv windows into the real cache (all ranks).
-        final_wins = final_conv_windows_batch(slot_tails, layout.slot_lens)
         slots = cache_indices.reshape(-1)[: layout.num_prefill_reqs]
-        conv_states[slots] = final_wins.to(dtype=conv_states.dtype)
 
         q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)

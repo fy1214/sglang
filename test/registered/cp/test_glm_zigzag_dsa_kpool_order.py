@@ -292,6 +292,12 @@ class TestGlmZigzagDsaKpoolOrder(CustomTestCase):
         self.assertEqual(plan.summary_idx.tolist(), [0, 1, 2, 3])  # (0*2+part)*N+n
         self.assertTrue(bool(plan.slot_present[0, 0]))
         self.assertEqual(int(plan.segment_of_slot[1, 3].item()), 3)
+        # Conv halo plan (vLLM gather_conv_tails / conv_windows indices).
+        self.assertEqual(tuple(plan.tail_src_idx.shape), (2 * 2 * 3,))
+        self.assertEqual(tuple(plan.halo_idx.shape), (4, 3))
+        self.assertEqual(tuple(plan.final_halo_idx.shape), (2, 3))
+        # First segment of req0 starts at chrono 0 → window is prefix rows.
+        self.assertEqual(plan.halo_idx[0].tolist(), [0, 1, 2])
 
     def test_kcp_merge_batched_and_left_api(self):
         s, n, h, dk, dv = 4, 2, 2, 3, 2
