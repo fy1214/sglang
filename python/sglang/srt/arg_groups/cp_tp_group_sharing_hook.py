@@ -53,6 +53,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     # Native MTP keeps the target's CP/TP placement; other draft architectures
     # have their own topology and model-boundary contracts.
     # Zigzag DSA/KCP first cut rejects speculative decoding (same as vLLM draft).
+    # #49089: interleave + native MTP/EAGLE topk1 is allowed.
     if cfg.speculative_algorithm is not None:
         if cfg.cp_strategy == "zigzag":
             raise ValueError(
@@ -68,13 +69,30 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
                 "CP/TP group sharing only supports native MTP with top-k 1."
             )
 
+    # DCP is intentionally allowed: persistent MLA KV uses the existing
+    # DCP stripe write (`set_mla_kv_buffer_dcp_sharded_*`) and CP extend
+    # temporarily materializes full KV into `dcp_kv_buffer` (#36990 CP-DCP).
+    # Prefill still shards compute via CP; KDA keeps SumGroup.TP under sharing.
     unsupported = {
         "enable-dsa-cache-layer-split": cfg.enable_dsa_cache_layer_split,
-        "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
-        "disaggregation-mode": cfg.disaggregation_mode != "null",
     }
+    # #43774: allow PD prefill + PCP for Glm5Next (mooncake).
+    # Decode PD remains blocked; non-Glm5Next still forbids all disaggregation.
+    if is_glm5_next:
+        if cfg.disaggregation_mode != "null":
+            unsupported |= {
+                "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
+                "disaggregation-transfer-backend != mooncake": (
+                    cfg.disaggregation_transfer_backend != "mooncake"
+                ),
+                "pp-size > 1": cfg.pp_size > 1,
+                "dp-size > 1": cfg.dp_size > 1,
+                "ep-size > 1": view.ep_size > 1,
+            }
+    else:
+        unsupported["disaggregation-mode"] = cfg.disaggregation_mode != "null"
     for flag, enabled in unsupported.items():
         if enabled:
             raise ValueError(f"--{flag} is not supported with CP-TP group sharing.")

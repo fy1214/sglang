@@ -1664,6 +1664,7 @@ class IndexerKPool(MultiPlatformOp):
             return None
         return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
 
+    # PATCHED_BY_46179_SMOKE_354033
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -1672,9 +1673,11 @@ class IndexerKPool(MultiPlatformOp):
         forward_batch: ForwardBatch,
         layer_id: int,
         return_indices: bool = True,
+        use_cuda_graph: bool = True,
     ) -> Optional[torch.Tensor]:
         if (
-            is_in_breakable_cuda_graph()
+            use_cuda_graph
+            and is_in_breakable_cuda_graph()
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             from sglang.srt.layers.attention.dsa.kpool_prefill_cuda_graph import (
@@ -1697,9 +1700,19 @@ class IndexerKPool(MultiPlatformOp):
             )
             return output if return_indices else None
         return self._forward_cuda_impl(
-            x, q_lora, positions, forward_batch, layer_id, return_indices
+            x,
+            q_lora,
+            positions,
+            forward_batch,
+            layer_id,
+            return_indices,
         )
 
+    @property
+    def topk_output_width(self):
+        return self.index_topk + self.index_kpool - 1
+
+    # PATCHED_BY_46179_SMOKE_354033_kpool_width
     def _forward_cuda_impl(
         self,
         x: torch.Tensor,

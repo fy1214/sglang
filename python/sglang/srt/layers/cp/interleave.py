@@ -41,6 +41,7 @@ from sglang.srt.layers.cp.base import (
     ContextParallelStrategy,
     ContextParallelStrategyKind,
     CPAttentionBackendKind,
+    get_cp_strategy,
 )
 from sglang.srt.layers.cp.padding import pad_local_rows
 from sglang.srt.layers.dp_attention import (
@@ -225,8 +226,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             self.cp_rank, int(num_tokens), self.cp_size, device=device, dtype=torch.long
         )
 
-    def shard_local_tokens(self, input_: Any, forward_batch=None) -> Any:
-        del forward_batch
+    def shard_local_tokens(self, input_: Any) -> Any:
         return self._interleave_shard(input_)
 
     def shard_per_request(
@@ -312,8 +312,12 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if physical_rank_len == 0:
             return x.new_empty((0, *x.shape[1:]))
 
-        padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
-        padded_x[:local_logical_len] = x[:local_logical_len]
+        # PATCHED_BY_46179_SMOKE_354033 equal-shard fast path
+        if local_logical_len == physical_rank_len and x.is_contiguous():
+            padded_x = x[:physical_rank_len]
+        else:
+            padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
+            padded_x[:local_logical_len] = x[:local_logical_len]
 
         with use_symmetric_memory(
             get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
@@ -416,3 +420,151 @@ def interleave_rows_per_request(
         counts.append((end - 1 - cp_rank) // cp_size - (start - 1 - cp_rank) // cp_size)
         start = end
     return counts
+
+
+# PATCHED_BY_46179_SMOKE_354033
+class DSAInterleaveCPIndexerOverlap:
+    """Per-forward MLA orchestration for attention KV/indexer overlap.
+
+    Port of sgl-project/sglang#46179 onto this tree. BCG bridge omitted; the
+    overlap path always uses eager run_indexer_with_kv_gather.
+    """
+
+    def __init__(self, attention, forward_batch):
+        self.attention = attention
+        self.forward_batch = forward_batch
+        self._kv = None
+        self._deferred = None
+
+    @property
+    def can_fuse_bmm(self):
+        return not (
+            self.attention.rotary_emb is not None
+            and is_interleave_extend(self.forward_batch)
+        )
+
+    def _can_overlap(self):
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+        from sglang.srt.utils import is_cuda
+
+        attention = self.attention
+        if not (
+            is_cuda()
+            and is_interleave_extend(self.forward_batch)
+            and hasattr(attention.indexer, "topk_output_width")
+        ):
+            return False
+        if not attention._fuse_rope_for_trtllm_mla(self.forward_batch):
+            return True
+        backend = get_attn_backend()
+        return (
+            getattr(backend, "dsa_prefill_impl", None) == "trtllm"
+            and not backend.use_mha
+        )
+
+    def run_indexer(self, *, k_nope, latent_cache, **indexer_args):
+        attention = self.attention
+        if not self._can_overlap():
+            return attention.indexer(**indexer_args)
+        if attention.rotary_emb is not None:
+            self._deferred = indexer_args
+            return None
+        kv_local = torch.cat(
+            (k_nope.squeeze(1), latent_cache[..., attention.kv_lora_rank :]),
+            dim=-1,
+        )
+        topk, self._kv = indexer_with_cp_kv(
+            attention.indexer, kv_local=kv_local, **indexer_args
+        )
+        return topk
+
+    def prepare_qkv(self, q_nope, q_pe, k_nope, k_pe, topk, *, defer_materialization):
+        from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
+
+        attention = self.attention
+        if self._deferred is not None:
+            if defer_materialization:
+                from sglang.kernels.ops.attention.utils import (
+                    mla_quantize_and_rope_for_fp8,
+                )
+
+                q_nope, k_nope, k_pe = mla_quantize_and_rope_for_fp8(
+                    q_nope,
+                    q_pe,
+                    k_nope.squeeze(1),
+                    k_pe.squeeze(1),
+                    self._deferred["positions"],
+                    attention.rotary_emb.cos_sin_cache,
+                    attention.rotary_emb.is_neox_style,
+                    attention.kv_lora_rank,
+                    attention.qk_rope_head_dim,
+                )
+                q_pe = None
+            kv_local = torch.cat(
+                (
+                    k_nope.reshape(-1, attention.kv_lora_rank),
+                    k_pe.reshape(-1, attention.qk_rope_head_dim),
+                ),
+                dim=-1,
+            )
+            topk, self._kv = indexer_with_cp_kv(
+                attention.indexer, kv_local=kv_local, **self._deferred
+            )
+
+        if self._kv is not None:
+            k_nope = self._kv[..., : attention.kv_lora_rank].unsqueeze(1)
+            k_pe = self._kv[..., attention.kv_lora_rank :].unsqueeze(1)
+        else:
+            k_nope, k_pe = prepare_kv_for_attention(
+                attention,
+                self.forward_batch,
+                k_nope,
+                k_pe,
+                defer_materialization=defer_materialization,
+            )
+        return q_nope, q_pe, k_nope, k_pe, topk
+
+
+def indexer_with_cp_kv(
+    indexer, x, q_lora, positions, forward_batch, layer_id, kv_local
+):
+    # Tree has no cp/bcg/interleave_bcg.py; always take the eager overlap path.
+    return run_indexer_with_kv_gather(
+        indexer, x, q_lora, positions, forward_batch, layer_id, kv_local
+    )
+
+
+def run_indexer_with_kv_gather(
+    indexer, x, q_lora, positions, forward_batch, layer_id, kv_local
+):
+    """Start KV replication before indexer projection/compression/scoring."""
+    from sglang.srt.runtime_context import get_stream
+
+    current_stream = torch.cuda.current_stream()
+    stream = get_stream("dsa_cp_kv")
+    stream.wait_stream(current_stream)
+
+    def gather_kv():
+        with torch.cuda.stream(stream):
+            if kv_local.dtype == torch.float8_e4m3fn:
+                return (
+                    get_cp_strategy()
+                    .gather_kv_cache(kv_local.view(torch.uint8), forward_batch)
+                    .view(kv_local.dtype)
+                )
+            return get_cp_strategy().gather_kv_cache(kv_local, forward_batch)
+
+    try:
+        kv_full = gather_kv()
+        topk = indexer.forward_cuda(
+            x=x,
+            q_lora=q_lora,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            use_cuda_graph=False,
+        )
+    finally:
+        current_stream.wait_stream(stream)
+    kv_full.record_stream(current_stream)
+    return topk, kv_full

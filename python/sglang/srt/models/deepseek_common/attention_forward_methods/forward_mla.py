@@ -14,12 +14,17 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
-from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
-from sglang.srt.layers.cp.mla_gather_overlap import (
-    clear_cp_mla_gather_overlap,
-    maybe_install_cp_mla_gather_overlap,
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    is_graph_dsa_split_op_surface,
 )
+from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
+from sglang.srt.layers.cp.interleave import (
+    DSAInterleaveCPIndexerOverlap,
+    is_interleave_extend,
+)
+
+# REMOVED_OUR_MLA_GATHER_OVERLAP_1cdbaa5f: keep #46179 only
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -89,12 +94,12 @@ def _select_local_dcp_heads_for_autotune(
     attn_output: torch.Tensor, num_local_heads: int
 ) -> torch.Tensor:
     """Select this rank's head shard without communicating dummy outputs."""
-    rank = get_parallel().attn_dcp_rank
+    rank = get_attn_backend().dcp_rank
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
 
 
 def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
-    if not get_parallel().dcp_enabled:
+    if get_attn_backend().dcp_size == 1:
         return False
     return (
         forward_batch.forward_mode.is_decode()
@@ -102,8 +107,56 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
     )
 
 
+def is_dsa_tp_dcp_prefill_phase(forward_batch: ForwardBatch, *, use_dsa: bool) -> bool:
+    """Whether DSA TP+DCP prefill attends rank-local KV after gathering Q."""
+    return (
+        use_dsa
+        and get_attn_backend().dcp_size > 1
+        and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+        and not dsa_use_prefill_cp(forward_batch)
+    )
+
+
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
+
+
+def is_dsa_dcp_lse_base_on_e(forward_batch: ForwardBatch) -> bool:
+    """Whether the active DSA implementation returns natural-log LSE."""
+    dsa_backend = get_attn_backend()
+    # Glm5Next hybrid wraps DSA as HybridLinearAttnBackend.full_attn_backend;
+    # dsa_*_impl live on the inner DSAAttnBackend, not the wrapper.
+    dsa_backend = getattr(dsa_backend, "full_attn_backend", dsa_backend)
+    forward_mode = forward_batch.forward_mode
+    use_decode_impl = (
+        forward_mode.is_decode_or_idle()
+        or forward_mode.is_target_verify()
+        or forward_mode.is_draft_extend_v2()
+    )
+    dsa_impl = (
+        dsa_backend.dsa_decode_impl if use_decode_impl else dsa_backend.dsa_prefill_impl
+    )
+    return dsa_impl == "flashmla_kv"
+
+
+def _zero_dsa_dcp_padding(
+    attn_output: torch.Tensor, forward_batch: ForwardBatch
+) -> None:
+    """Clear attention-TP padding from DSA DCP outputs."""
+    # Host int on current ForwardBatch is global_num_token_non_padded_cpu
+    # (older trees called it num_token_non_padded_cpu; #36990 port kept the
+    # old name). Prefer the modern field; fall back for mixed checkouts.
+    num_valid_tokens = (
+        forward_batch.extend_num_tokens
+        if get_attn_tp_context().input_scattered
+        else getattr(
+            forward_batch,
+            "global_num_token_non_padded_cpu",
+            getattr(forward_batch, "num_token_non_padded_cpu", None),
+        )
+    )
+    if num_valid_tokens is not None and num_valid_tokens < attn_output.shape[0]:
+        attn_output[num_valid_tokens:] = 0
 
 
 if _is_cuda:
@@ -169,6 +222,10 @@ class DeepseekMLAForwardMixin:
         if not is_graph_dsa_split_op_surface(forward_batch):
             return False
         if not self.use_dsa:
+            return False
+        # DCP must receive each rank's local LSE so it can combine partial
+        # attention outputs. The composite graph op only returns the output.
+        if get_attn_backend().dcp_size > 1:
             return False
         if self.use_deep_gemm_bmm:
             return False
@@ -265,7 +322,7 @@ class DeepseekMLAForwardMixin:
             return None
         if get_is_capture_mode():
             return None
-        if get_parallel().dcp_enabled:
+        if get_attn_backend().dcp_size > 1:
             return None
         # Kernel shape constraints (tl.arange / tl.dot / block tiling).  K
         # (qk_nope_head_dim) needs only K % 16 == 0 and K <= 256: power-of-2
@@ -308,9 +365,16 @@ class DeepseekMLAForwardMixin:
             else None
         )
 
+        # PATCHED_BY_46179_SMOKE_354033
+        cp_overlap = (
+            DSAInterleaveCPIndexerOverlap(self, forward_batch)
+            if self.use_dsa and is_interleave_extend(forward_batch)
+            else None
+        )
         fuse_bmm_attention = (
             self.q_lora_rank is not None
             and self._can_fuse_bmm_into_attention(forward_batch)
+            and (cp_overlap is None or cp_overlap.can_fuse_bmm)
         )
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
@@ -392,7 +456,7 @@ class DeepseekMLAForwardMixin:
                     # full-head Q from the gathered weight (skips Q all-gather)
                     q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
                         -1,
-                        self.num_local_heads * get_parallel().attn_dcp_size,
+                        self.num_local_heads * get_attn_backend().dcp_size,
                         self.qk_head_dim,
                     )
                 else:
@@ -445,35 +509,27 @@ class DeepseekMLAForwardMixin:
                             )
                         self._q8kv8_qprep_overlap_pending = True
 
-                # Prefill-CP: stash pre-rope pe so that after compression-input
-                # gather we can start MLA latent KV gather on alt_stream under
-                # compress→topk. Skip when Q8KV8 already owns alt_stream or
-                # born-fp8 will re-rope/cast.
-                if (
-                    q_lora is not None
-                    and not self._q8kv8_qprep_overlap_pending
-                    and not _ENABLE_DSA_Q8KV8_BORN_FP8_Q
-                ):
-                    if q_pe is None or k_pe is None:
-                        q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
-                    maybe_install_cp_mla_gather_overlap(
-                        self,
-                        forward_batch,
-                        k_nope,
-                        k_pe,
-                        q_pe,
-                        positions,
-                    )
-
+                # Prefill-CP indexer: #46179 DSAInterleaveCPIndexerOverlap only.
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):
-                        topk_indices = self.indexer(
-                            x=hidden_states,
-                            q_lora=q_lora,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            layer_id=self.layer_id,
-                        )
+                        if cp_overlap is not None:
+                            topk_indices = cp_overlap.run_indexer(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                                layer_id=self.layer_id,
+                                k_nope=k_nope,
+                                latent_cache=latent_cache,
+                            )
+                        else:
+                            topk_indices = self.indexer(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                                layer_id=self.layer_id,
+                            )
                     else:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
@@ -484,7 +540,7 @@ class DeepseekMLAForwardMixin:
                     hidden_states, self.q_b_proj_qrep_weight
                 ).view(
                     -1,
-                    self.num_local_heads * get_parallel().attn_dcp_size,
+                    self.num_local_heads * get_attn_backend().dcp_size,
                     self.qk_head_dim,
                 )
             else:
@@ -601,58 +657,57 @@ class DeepseekMLAForwardMixin:
             elif is_kv_b_lora_active(self):
                 q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
-        # Prefill-CP MLA latent KV gather may still be running on alt_stream
-        # (started after compression-input gather). Q absorb above can overlap
-        # its tail; join before rope/KV consumers. Singleton alt_stream must
-        # be free before the next layer.
-        overlap_state = getattr(forward_batch, "cp_mla_gather_overlap", None)
-        overlap_done = bool(overlap_state is not None and overlap_state.launched)
-
+        # REMOVED_OUR_MLA_GATHER_OVERLAP_1cdbaa5f: rope + #46179 prepare_qkv only (no 1cdbaa5f overlap_state).
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
-        if overlap_done:
-            k_nope, k_pe, q_pe, _roped = overlap_state.wait_and_take()
-            clear_cp_mla_gather_overlap(forward_batch)
-        else:
-            if overlap_state is not None:
-                clear_cp_mla_gather_overlap(forward_batch)
-            if (
-                self.rotary_emb is not None
-                and not fuse_rope_for_trtllm_mla
-                # Already applied at the q-prep/indexer overlap fork.
-                and not self._q8kv8_qprep_overlap_pending
-            ):
-                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        if (
+            self.rotary_emb is not None
+            and not fuse_rope_for_trtllm_mla
+            # Already applied at the q-prep/indexer overlap fork.
+            and not self._q8kv8_qprep_overlap_pending
+        ):
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-            if born_q_backend is not None:
-                # Born-fp8 q (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): one fused
-                # kernel replaces bmm -> bf16 q_nope_out ->
-                # concat_and_cast_q_fp8_pad.  q_nope is the pre-absorb bf16 view
-                # (rope only touched the disjoint q_pe columns) and q_pe carries
-                # the post-rope values.  The stash is consumed by
-                # _forward_flashmla_sparse_q8kv8; q_nope_out becomes a
-                # NaN-poisoned shape-only sentinel.
-                num_tokens = q_nope.shape[0]
-                if self._q8kv8_qprep_overlap_pending:
-                    # q_fp8 was produced on alt_stream at the fork above; join so
-                    # everything downstream (incl. the next layer's fork, which
-                    # reuses the single born-q slot) orders after it.
-                    torch.cuda.current_stream().wait_stream(self.alt_stream)
-                    self._q8kv8_qprep_overlap_pending = False
-                else:
-                    q_fp8 = born_q_backend.q8kv8_acquire_born_q_buffer(
-                        num_tokens,
-                        self.num_local_heads,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                        q_nope.device,
-                    )
-                    absorbed_bmm_concat_cast_q_fp8(
-                        q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
-                    )
-                born_q_backend.q8kv8_stash_born_q(num_tokens, self.attn_mqa.layer_id)
-                q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
-                    num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
+        if born_q_backend is not None:
+            # Born-fp8 q (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): one fused
+            # kernel replaces bmm -> bf16 q_nope_out ->
+            # concat_and_cast_q_fp8_pad.  q_nope is the pre-absorb bf16 view
+            # (rope only touched the disjoint q_pe columns) and q_pe carries
+            # the post-rope values.  The stash is consumed by
+            # _forward_flashmla_sparse_q8kv8; q_nope_out becomes a
+            # NaN-poisoned shape-only sentinel.
+            num_tokens = q_nope.shape[0]
+            if self._q8kv8_qprep_overlap_pending:
+                # q_fp8 was produced on alt_stream at the fork above; join so
+                # everything downstream (incl. the next layer's fork, which
+                # reuses the single born-q slot) orders after it.
+                torch.cuda.current_stream().wait_stream(self.alt_stream)
+                self._q8kv8_qprep_overlap_pending = False
+            else:
+                q_fp8 = born_q_backend.q8kv8_acquire_born_q_buffer(
+                    num_tokens,
+                    self.num_local_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    q_nope.device,
                 )
+                absorbed_bmm_concat_cast_q_fp8(
+                    q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
+                )
+            born_q_backend.q8kv8_stash_born_q(num_tokens, self.attn_mqa.layer_id)
+            q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
+                num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
+            )
 
+        # PATCHED_BY_46179_SMOKE_354033
+        if cp_overlap is not None:
+            q_nope_out, q_pe, k_nope, k_pe, topk_indices = cp_overlap.prepare_qkv(
+                q_nope_out,
+                q_pe,
+                k_nope,
+                k_pe,
+                topk_indices,
+                defer_materialization=fuse_rope_for_trtllm_mla,
+            )
+        else:
             k_nope, k_pe = prepare_kv_for_attention(
                 self,
                 forward_batch,
@@ -661,27 +716,34 @@ class DeepseekMLAForwardMixin:
                 defer_materialization=fuse_rope_for_trtllm_mla,
             )
 
-        # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
-        if get_parallel().dcp_enabled:
+        # Decode and DSA TP-prefill gather Q and reduce partial attention with
+        # LSE. DSA CP-prefill (like dense MLA prefill) gathers KV instead.
+        # Role-aware: replicated drafts keep dcp_size=1 and skip these paths.
+        if get_attn_backend().dcp_size > 1:
             if is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
                     )
-            elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv
-                all_gather_kv_cache_for_mla_extend(
-                    get_token_to_kv_pool(),
-                    self.attn_mqa,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
-                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
-                    self.kv_lora_rank,
-                    k_nope,
-                    k_pe,
-                )
+            elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                if is_dsa_tp_dcp_prefill_phase(forward_batch, use_dsa=self.use_dsa):
+                    q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                        q_nope_out=q_nope_out,
+                        q_pe=q_pe,
+                    )
+                else:
+                    all_gather_kv_cache_for_mla_extend(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                        forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
+                        forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                        self.kv_lora_rank,
+                        k_nope,
+                        k_pe,
+                    )
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
@@ -722,12 +784,16 @@ class DeepseekMLAForwardMixin:
         attention_output_gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True
+        # Set only by the DCP attention branches; the combine below asserts on
+        # it so a fusion path silently skipping the LSE fails loudly.
+        lse = None
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
             if getattr(self, "learnable_sink_param", None) is not None:
                 extra_args["attn_sink"] = self.learnable_sink_param
-            if self._fuse_rope_for_trtllm_mla(forward_batch):
+            # PATCHED_BY_46179_SMOKE_354033
+            if q_pe is not None and self._fuse_rope_for_trtllm_mla(forward_batch):
                 extra_args.update(
                     cos_sin_cache=self.rotary_emb.cos_sin_cache,
                     is_neox=self.rotary_emb.is_neox_style,
@@ -756,8 +822,11 @@ class DeepseekMLAForwardMixin:
                     topk_indices=topk_indices,
                 )
                 attn_output = fusion_plan.attn_output_buf
-            elif is_dcp_mla_decode_phase(forward_batch):
-                # set return_lse=True to correct attn_output
+            elif is_dcp_mla_decode_phase(forward_batch) or is_dsa_tp_dcp_prefill_phase(
+                forward_batch, use_dsa=self.use_dsa
+            ):
+                # Q-gather DCP (decode and TP+DCP extend) attends each rank's
+                # local KV shard and returns an LSE for cross-rank combine.
                 attn_output, lse = self.attn_mqa_for_dcp_decode(
                     q_nope_out,
                     k_nope,
@@ -803,12 +872,20 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+        if self.use_dsa and get_attn_backend().dcp_size > 1:
+            _zero_dsa_dcp_padding(attn_output, forward_batch)
 
         # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch):
+        if is_dcp_mla_decode_phase(forward_batch) or is_dsa_tp_dcp_prefill_phase(
+            forward_batch, use_dsa=self.use_dsa
+        ):
+            assert lse is not None, (
+                "DCP LSE combine reached without an LSE — the attention call "
+                "above must go through the attn_mqa_for_dcp_decode branch."
+            )
             attn_output = attn_output.view(
                 -1,
-                self.num_local_heads * get_parallel().attn_dcp_size,
+                self.num_local_heads * get_attn_backend().dcp_size,
                 self.kv_lora_rank,
             )
             if get_in_autotune_dummy_run():
@@ -820,11 +897,13 @@ class DeepseekMLAForwardMixin:
                 )
             else:
                 dcp_comm_backend = get_parallel().dcp_comm_backend
-                is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
-                    self.current_attention_backend
+                is_lse_base_on_e = (
+                    is_dsa_dcp_lse_base_on_e(forward_batch)
+                    if self.use_dsa
+                    else is_mla_dcp_lse_base_on_e(self.current_attention_backend)
                 )
                 if dcp_comm_backend in ("a2a", "fi_a2a"):
-                    # A2A exchange of head partials + LSE, then local Triton combine.
+                    # Exchange head partials + LSE, then combine locally.
                     attn_output = dcp_a2a_lse_reduce(
                         attn_output.contiguous(),
                         lse.contiguous(),
