@@ -985,8 +985,14 @@ def merge_packed_flash_summaries(
     *,
     cp_size: int,
     s_base_flash: Optional[torch.Tensor] = None,
+    num_segments: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fold physical ``[2P, N, H, V+K, K]`` BF16 ``[S^T; M^T]`` summaries.
+
+    Converts flash value-first packed blocks into chronological key-first
+    ``(s_ext, m)`` and reuses Triton ``kcp_merge_left`` (no per-slot
+    ``.item()`` sync storm). Prefill-with-prefix is rejected upstream, so
+    ``s_base_flash`` must be ``None`` for the fast path.
 
     Returns:
         ``initial`` value-first FP32 ``[L, H, V, K]`` for local segments,
@@ -997,39 +1003,72 @@ def merge_packed_flash_summaries(
     num_slots = 2 * cp_size
     if num_phys != num_slots:
         raise ValueError(f"packed phys {num_phys} != 2*cp {num_slots}")
-    if bool((segment_of_slot >= 0).any()):
-        num_segments = int(segment_of_slot.max().item()) + 1
-    else:
-        num_segments = 0
+    if num_segments is None:
+        # Single host sync only when the caller did not pass layout.num_segments.
+        if bool((segment_of_slot >= 0).any()):
+            num_segments = int(segment_of_slot.max().item()) + 1
+        else:
+            num_segments = 0
 
-    device, dtype = packed.device, torch.float32
-    initial = torch.zeros(
-        max(num_segments, 1), heads, d_v, d_k, device=device, dtype=dtype
+    device = packed.device
+    dtype = torch.float32
+    # Physical → chronological without Python matmul / .item() in the fold.
+    phys_idx = torch.tensor(
+        [_chrono_to_physical_slot(c, cp_size) for c in range(num_slots)],
+        device=device,
+        dtype=torch.long,
     )
-    if s_base_flash is None:
-        state = torch.zeros(n_req, heads, d_v, d_k, device=device, dtype=dtype)
-    else:
-        state = s_base_flash.to(device=device, dtype=dtype)
+    chrono_packed = packed.float().index_select(0, phys_idx)  # [S,N,H,V+K,K]
+    s_t = chrono_packed[:, :, :, :d_v, :]  # [S,N,H,V,K] = S^T
+    m_t = chrono_packed[:, :, :, d_v:, :]  # [S,N,H,K,K] = M^T
+    # key-first: S = (S^T)^T, M = (M^T)^T, state' = S + M @ state
+    s_ext = s_t.transpose(-2, -1).contiguous()  # [S,N,H,K,V]
+    m = m_t.transpose(-2, -1).contiguous()  # [S,N,H,K,K]
 
-    packed_f = packed.float()
-    for chrono in range(num_slots):
-        phys = _chrono_to_physical_slot(chrono, cp_size)
+    if s_base_flash is not None:
+        # Triton kcp_merge_left currently starts from zeros; keep a rare
+        # Python fallback if a nonempty base state is ever passed.
+        s_base = (
+            s_base_flash.to(device=device, dtype=dtype).transpose(-2, -1).contiguous()
+        )
+        s_in_all, s_final = merge_affine_segment_states_batched(
+            s_ext, m, slot_present, s_base=s_base
+        )
+        initial = s_ext.new_zeros(max(num_segments, 1), heads, d_k, d_v)
         for n in range(n_req):
-            seg = int(segment_of_slot[n, chrono].item())
-            if seg >= 0:
-                initial[seg] = state[n]
-            if not bool(slot_present[n, chrono].item()):
-                continue
-            block = packed_f[phys, n]  # [H, V+K, K]
-            s_t = block[:, :d_v, :]
-            m_t = block[:, d_v:, :]
-            # value-first: state' = S^T + state @ M^T
-            state[n] = s_t + torch.matmul(state[n], m_t)
+            for slot in range(num_slots):
+                seg = int(segment_of_slot[n, slot].item())
+                if seg >= 0:
+                    initial[seg].copy_(s_in_all[slot, n])
+        final_kf = s_final
+        if num_segments == 0:
+            initial = initial[:0]
+        else:
+            initial = initial[:num_segments]
+        return initial.transpose(-2, -1).contiguous(), final_kf.transpose(
+            -2, -1
+        ).contiguous()
+
+    initial_kf = torch.zeros(
+        max(num_segments, 1), heads, d_k, d_v, device=device, dtype=dtype
+    )
+    final_kf = torch.zeros(n_req, heads, d_k, d_v, device=device, dtype=dtype)
+    kcp_merge_left(
+        s_ext,
+        m,
+        slot_present,
+        segment_of_slot,
+        initial_kf,
+        final_kf,
+    )
     if num_segments == 0:
-        initial = initial[:0]
+        initial_kf = initial_kf[:0]
     else:
-        initial = initial[:num_segments]
-    return initial, state
+        initial_kf = initial_kf[:num_segments]
+    # flash scan wants value-first [L,H,V,K] / [N,H,V,K]
+    return initial_kf.transpose(-2, -1).contiguous(), final_kf.transpose(
+        -2, -1
+    ).contiguous()
 
 
 def run_zigzag_kcp_flash(
@@ -1126,6 +1165,7 @@ def run_zigzag_kcp_flash(
         plan.segment_of_slot,
         cp_size=cp_size,
         s_base_flash=s_base_flash,
+        num_segments=layout.num_segments,
     )
 
     out = torch.empty_like(v)
