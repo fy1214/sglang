@@ -88,12 +88,21 @@ def set_mla_kv_buffer_kernel_norope(
     kv_buffer_ptr,
     cache_k_nope_ptr,
     loc_ptr,
+    reserved_skip_index,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
     nope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
     USE_GDC: tl.constexpr = False,
 ):
+    """No-RoPE MLA KV write with the same DCP owner rule as the rope kernel.
+
+    FP8 DSA (rope width 0) hits this path. Callers still pass logical widened
+    locs from ``set_mla_kv_buffer_dcp_sharded_triton``; without owner select +
+    ``loc // dcp`` those ids are treated as physical rows → OOB/ILA.
+    """
     pid_loc = tl.program_id(0)
     pid_blk = tl.program_id(1)
 
@@ -105,13 +114,16 @@ def set_mla_kv_buffer_kernel_norope(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+    is_valid = (loc != reserved_skip_index) & (loc % DCP_WORLD_SIZE == DCP_RANK)
+    safe_loc = tl.where(is_valid, loc, 0)
+    safe_loc = safe_loc // DCP_WORLD_SIZE
+    dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
 
     src = tl.load(
         cache_k_nope_ptr + pid_loc * nope_stride + offs,
         mask=mask,
     )
-    tl.store(dst_ptr, src, mask=mask)
+    tl.store(dst_ptr, src, mask=mask & is_valid)
 
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
@@ -167,10 +179,13 @@ def _set_mla_kv_buffer_impl(
             kv_buffer,
             cache_k_nope,
             loc,
+            reserved_skip_index,
             kv_buffer.stride(0),
             cache_k_nope.stride(0),
             nope_dim,
             BLOCK=BLOCK,
+            DCP_RANK=dcp_rank,
+            DCP_WORLD_SIZE=dcp_world_size,
             **pdl_kwargs,
         )
         return
