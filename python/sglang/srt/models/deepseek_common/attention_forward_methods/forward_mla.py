@@ -19,6 +19,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
+from sglang.srt.layers.cp.interleave import (
+    DSAInterleaveCPIndexerOverlap,
+    is_interleave_extend,
+)
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -359,9 +363,15 @@ class DeepseekMLAForwardMixin:
             else None
         )
 
+        cp_overlap = (
+            DSAInterleaveCPIndexerOverlap(self, forward_batch)
+            if self.use_dsa and is_interleave_extend(forward_batch)
+            else None
+        )
         fuse_bmm_attention = (
             self.q_lora_rank is not None
             and self._can_fuse_bmm_into_attention(forward_batch)
+            and (cp_overlap is None or cp_overlap.can_fuse_bmm)
         )
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
@@ -496,16 +506,27 @@ class DeepseekMLAForwardMixin:
                             )
                         self._q8kv8_qprep_overlap_pending = True
 
-
+                # Prefill-CP indexer: #46179 DSAInterleaveCPIndexerOverlap.
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):
-                        topk_indices = self.indexer(
-                            x=hidden_states,
-                            q_lora=q_lora,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            layer_id=self.layer_id,
-                        )
+                        if cp_overlap is not None:
+                            topk_indices = cp_overlap.run_indexer(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                                layer_id=self.layer_id,
+                                k_nope=k_nope,
+                                latent_cache=latent_cache,
+                            )
+                        else:
+                            topk_indices = self.indexer(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                                layer_id=self.layer_id,
+                            )
                     else:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
@@ -529,7 +550,6 @@ class DeepseekMLAForwardMixin:
 
         if q_nope is None:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
-
 
         _kvb_q = None
         born_q_backend = None
@@ -636,23 +656,14 @@ class DeepseekMLAForwardMixin:
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         if (
-
             self.rotary_emb is not None
-
             and not fuse_rope_for_trtllm_mla
-
             # Already applied at the q-prep/indexer overlap fork.
-
             and not self._q8kv8_qprep_overlap_pending
-
         ):
-
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-
-
         if born_q_backend is not None:
-
             # Born-fp8 q (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): one fused
 
             # kernel replaces bmm -> bf16 q_nope_out ->
@@ -670,7 +681,6 @@ class DeepseekMLAForwardMixin:
             num_tokens = q_nope.shape[0]
 
             if self._q8kv8_qprep_overlap_pending:
-
                 # q_fp8 was produced on alt_stream at the fork above; join so
 
                 # everything downstream (incl. the next layer's fork, which
@@ -682,48 +692,40 @@ class DeepseekMLAForwardMixin:
                 self._q8kv8_qprep_overlap_pending = False
 
             else:
-
                 q_fp8 = born_q_backend.q8kv8_acquire_born_q_buffer(
-
                     num_tokens,
-
                     self.num_local_heads,
-
                     self.kv_lora_rank + self.qk_rope_head_dim,
-
                     q_nope.device,
-
                 )
 
                 absorbed_bmm_concat_cast_q_fp8(
-
                     q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
-
                 )
 
             born_q_backend.q8kv8_stash_born_q(num_tokens, self.attn_mqa.layer_id)
 
             q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
-
                 num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
-
             )
 
-
-
-        k_nope, k_pe = prepare_kv_for_attention(
-
-            self,
-
-            forward_batch,
-
-            k_nope,
-
-            k_pe,
-
-            defer_materialization=fuse_rope_for_trtllm_mla,
-
-        )
+        if cp_overlap is not None:
+            q_nope_out, q_pe, k_nope, k_pe, topk_indices = cp_overlap.prepare_qkv(
+                q_nope_out,
+                q_pe,
+                k_nope,
+                k_pe,
+                topk_indices,
+                defer_materialization=fuse_rope_for_trtllm_mla,
+            )
+        else:
+            k_nope, k_pe = prepare_kv_for_attention(
+                self,
+                forward_batch,
+                k_nope,
+                k_pe,
+                defer_materialization=fuse_rope_for_trtllm_mla,
+            )
 
         # Decode and DSA TP-prefill gather Q and reduce partial attention with
         # LSE. DSA CP-prefill (like dense MLA prefill) gathers KV instead.
@@ -800,7 +802,7 @@ class DeepseekMLAForwardMixin:
             extra_args = {}
             if getattr(self, "learnable_sink_param", None) is not None:
                 extra_args["attn_sink"] = self.learnable_sink_param
-            if self._fuse_rope_for_trtllm_mla(forward_batch):
+            if q_pe is not None and self._fuse_rope_for_trtllm_mla(forward_batch):
                 extra_args.update(
                     cos_sin_cache=self.rotary_emb.cos_sin_cache,
                     is_neox=self.rotary_emb.is_neox_style,
