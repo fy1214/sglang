@@ -1170,6 +1170,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         self.full_attn_layers = full_attn_layers
         self.full_attn_backend = full_attn_backend
+        # Role-aware DCP span must surface on the wrapper get_attn_backend() returns.
+        self.dcp_size = full_attn_backend.dcp_size
+        self.dcp_rank = full_attn_backend.dcp_rank
         self.linear_attn_backend = linear_attn_backend
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool

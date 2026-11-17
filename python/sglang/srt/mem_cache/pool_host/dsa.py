@@ -83,8 +83,11 @@ class DSAIndexerPoolHost(HostKVCache):
             self.index_head_dim
             + self.index_head_dim // self.indexer_quant_block_size * 4
         )
-        self.size = anchor_host.size
-        self.page_num = anchor_host.page_num
+        # Index-K stays replicated under DCP, so it spans every widened logical
+        # slot while a DCP anchor stores only this rank's rows. Draft sidecars
+        # already size the anchor to the logical space (dcp_size=1 there).
+        self.size = anchor_host.logical_size
+        self.page_num = self.size // self.page_size
 
         self.indexer_page_stride_size = (
             self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
