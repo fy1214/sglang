@@ -26,6 +26,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.layers.cp.async_projection import prepare_kda_cp_async_graph
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
@@ -35,6 +36,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -102,7 +104,7 @@ class PrefillCPBCGInput:
     @classmethod
     def create(cls, runner: PrefillCudaGraphRunner) -> PrefillCPBCGInput:
         with torch.device(runner.device):
-            return cls(
+            result = cls(
                 input_embeds=torch.zeros(
                     (
                         runner.max_num_tokens,
@@ -115,6 +117,13 @@ class PrefillCPBCGInput:
                     dtype=torch.int64,
                 ),
             )
+        cp_size = max(get_parallel().attn_cp_size, 1)
+        prepare_kda_cp_async_graph(
+            (runner.max_num_tokens + cp_size - 1) // cp_size,
+            runner.model_runner.model_config.hidden_size,
+            runner.device,
+        )
+        return result
 
     def required_local_tokens(self, extend_seq_lens: Any) -> Optional[int]:
         """Return the aligned CP-local rows required by a live zigzag layout."""
