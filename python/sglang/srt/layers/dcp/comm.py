@@ -253,51 +253,62 @@ def all_gather_kv_cache_for_mla_extend(
     FlashMLA-KV preserves packed FP8 rows byte-exactly; other paths use the
     latent representation. The temporary buffer mirrors the persistent pool's
     row layout and dtype.
+
+    When ``SGLANG_ENABLE_DCP_KV_BUFFER_PREFETCH`` has a matching pending
+    next-layer prefix prefetch, the sync prefix AllGather is skipped and only
+    the local extend K is appended.
     """
     use_packed_fp8_buffer = bool(
         getattr(token_to_kv_pool, "dsa_kv_cache_store_fp8", False)
     )
-    prefix_tokens = sum(int(x) for x in extend_prefix_lens_cpu)
-    extend_prefix_lens = torch.tensor(extend_prefix_lens_cpu, dtype=torch.int32)
-    if prefix_tokens == 0:
-        gathered_kv = (
-            dcp_kv_buffer.view(torch.uint8)[:0]
-            if use_packed_fp8_buffer
-            else dcp_kv_buffer[:0]
-        )
-    elif use_packed_fp8_buffer:
-        # A packed row mixes FP8 values, FP32 scales and BF16 RoPE bytes.
-        # Gather it as uint8 so NCCL cannot reinterpret or convert any field.
-        persistent_kv = token_to_kv_pool.get_key_buffer(attn_mqa.layer_id)
-        local_prefix = persistent_kv.view(torch.uint8)[dcp_local_prefix_kv_indices]
-        gathered_kv = all_gather_kv_cache_for_dcp(
-            local_prefix,
-            None,
-            extend_prefix_lens,
-            prefix_starts_cpu=torch.zeros_like(extend_prefix_lens),
-        )
-    else:
-        cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
-            attn_mqa,
-            dcp_local_prefix_kv_indices,
-            dst_dtype=k_nope.dtype,
-        )
-        gathered_kv = all_gather_kv_cache_for_dcp(
-            cache_k_nope,
-            cache_k_rope,
-            extend_prefix_lens,
-            prefix_starts_cpu=torch.zeros_like(extend_prefix_lens),
-        )
-    if gathered_kv.shape[0] != dcp_extend_prefix_lens_sum:
-        raise RuntimeError(
-            "DCP gathered prefix length mismatch: "
-            f"gathered={gathered_kv.shape[0]}, "
-            f"expected={dcp_extend_prefix_lens_sum}."
-        )
-    if use_packed_fp8_buffer:
-        dcp_kv_buffer.view(torch.uint8)[:dcp_extend_prefix_lens_sum] = gathered_kv
-    else:
-        dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
+    # Lazy import: kv_buffer_prefetch imports all_gather_kv_cache_for_dcp from here.
+    from sglang.srt.layers.dcp.kv_buffer_prefetch import (
+        try_consume_dcp_kv_buffer_prefix_prefetch,
+    )
+
+    prefix_ready = try_consume_dcp_kv_buffer_prefix_prefetch(attn_mqa.layer_id)
+    if not prefix_ready:
+        prefix_tokens = sum(int(x) for x in extend_prefix_lens_cpu)
+        extend_prefix_lens = torch.tensor(extend_prefix_lens_cpu, dtype=torch.int32)
+        if prefix_tokens == 0:
+            gathered_kv = (
+                dcp_kv_buffer.view(torch.uint8)[:0]
+                if use_packed_fp8_buffer
+                else dcp_kv_buffer[:0]
+            )
+        elif use_packed_fp8_buffer:
+            # A packed row mixes FP8 values, FP32 scales and BF16 RoPE bytes.
+            # Gather it as uint8 so NCCL cannot reinterpret or convert any field.
+            persistent_kv = token_to_kv_pool.get_key_buffer(attn_mqa.layer_id)
+            local_prefix = persistent_kv.view(torch.uint8)[dcp_local_prefix_kv_indices]
+            gathered_kv = all_gather_kv_cache_for_dcp(
+                local_prefix,
+                None,
+                extend_prefix_lens,
+                prefix_starts_cpu=torch.zeros_like(extend_prefix_lens),
+            )
+        else:
+            cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+                attn_mqa,
+                dcp_local_prefix_kv_indices,
+                dst_dtype=k_nope.dtype,
+            )
+            gathered_kv = all_gather_kv_cache_for_dcp(
+                cache_k_nope,
+                cache_k_rope,
+                extend_prefix_lens,
+                prefix_starts_cpu=torch.zeros_like(extend_prefix_lens),
+            )
+        if gathered_kv.shape[0] != dcp_extend_prefix_lens_sum:
+            raise RuntimeError(
+                "DCP gathered prefix length mismatch: "
+                f"gathered={gathered_kv.shape[0]}, "
+                f"expected={dcp_extend_prefix_lens_sum}."
+            )
+        if use_packed_fp8_buffer:
+            dcp_kv_buffer.view(torch.uint8)[:dcp_extend_prefix_lens_sum] = gathered_kv
+        else:
+            dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
     current_end = dcp_extend_prefix_lens_sum + k_nope.shape[0]
     if current_end > dcp_kv_buffer.shape[0]:
